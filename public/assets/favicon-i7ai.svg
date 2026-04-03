@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="10" fill="#ffffff"/>
+  <rect x="4" y="10" width="56" height="36" fill="none" stroke="#111111" stroke-width="3"/>
+  <text x="32" y="37" text-anchor="middle" font-size="22" font-family="Georgia, Times New Roman, serif" font-weight="700" fill="#111111">I7</text>
+  <text x="32" y="56" text-anchor="middle" font-size="8" font-family="Arial, sans-serif" letter-spacing="1.4" fill="#111111">I7AI</text>
+</svg>

@@ -1,0 +1,10 @@
+.env
+vendor/
+storage/logs/
+storage/tmp/
+storage/audio-debug/
+storage/data/*.json
+*.log
+log_*.txt
+*.zip
+*.rar

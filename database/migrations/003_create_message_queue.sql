@@ -1,0 +1,8 @@
+CREATE TABLE message_queue (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    phone VARCHAR(30) NOT NULL,
+    message_text LONGTEXT NULL,
+    message_type VARCHAR(30) NOT NULL,
+    processed TINYINT(1) NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

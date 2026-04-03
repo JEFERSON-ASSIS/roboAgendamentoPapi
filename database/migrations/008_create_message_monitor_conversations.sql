@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS message_monitor_conversations (
+    phone VARCHAR(30) NOT NULL PRIMARY KEY,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    last_read_message_id INT NOT NULL DEFAULT 0,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
