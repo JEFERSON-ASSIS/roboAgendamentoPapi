@@ -12,18 +12,23 @@ class JsonSessionRepository implements SessionRepositoryInterface
     ) {
     }
 
-    public function findByPhone(string $phone): ?SessionDTO
+    public function findByPhone(string $phone, ?string $provider = null): ?SessionDTO
     {
         $sessions = $this->readAll();
+        $key = $this->buildKey($phone, $provider);
 
-        if (!isset($sessions[$phone]) || !is_array($sessions[$phone])) {
+        if ((!isset($sessions[$key]) || !is_array($sessions[$key])) && isset($sessions[$phone]) && is_array($sessions[$phone])) {
+            $key = $phone;
+        }
+
+        if (!isset($sessions[$key]) || !is_array($sessions[$key])) {
             return null;
         }
 
-        $row = $sessions[$phone];
+        $row = $sessions[$key];
 
         if ($this->isExpired($row['last_interaction_at'] ?? null)) {
-            unset($sessions[$phone]);
+            unset($sessions[$key]);
             $this->writeAll($sessions);
 
             return null;
@@ -37,24 +42,42 @@ class JsonSessionRepository implements SessionRepositoryInterface
         $sessions = $this->readAll();
         $data = $session->toArray();
         $data['last_interaction_at'] = date('Y-m-d H:i:s');
-        $sessions[$session->phone] = $data;
+        $sessions[$this->buildKey($session->phone, $session->provider)] = $data;
         $this->writeAll($sessions);
 
         return $session;
     }
 
-    public function deleteByPhone(string $phone): int
+    public function deleteByPhone(string $phone, ?string $provider = null): int
     {
         $sessions = $this->readAll();
 
-        if (!isset($sessions[$phone])) {
-            return 0;
+        if ($provider !== null && trim($provider) !== '') {
+            $key = $this->buildKey($phone, $provider);
+
+            if (!isset($sessions[$key])) {
+                return 0;
+            }
+
+            unset($sessions[$key]);
+            $this->writeAll($sessions);
+
+            return 1;
         }
 
-        unset($sessions[$phone]);
-        $this->writeAll($sessions);
+        $removed = 0;
+        foreach (array_keys($sessions) as $key) {
+            if ((string) $key === $phone || preg_match('/:' . preg_quote($phone, '/') . '$/', (string) $key) === 1) {
+                unset($sessions[$key]);
+                $removed++;
+            }
+        }
 
-        return 1;
+        if ($removed > 0) {
+            $this->writeAll($sessions);
+        }
+
+        return $removed;
     }
 
     private function readAll(): array
@@ -96,4 +119,12 @@ class JsonSessionRepository implements SessionRepositoryInterface
 
         return $timestamp < strtotime('-' . $this->ttlMinutes . ' minutes');
     }
+
+    private function buildKey(string $phone, ?string $provider = null): string
+    {
+        $provider = strtolower(trim((string) ($provider ?? 'evolution'))) ?: 'evolution';
+
+        return $provider . ':' . $phone;
+    }
 }
+

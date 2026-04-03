@@ -20,7 +20,7 @@ class IntentDetector
             return 'change_cpf';
         }
 
-        if ($this->containsAny($text, ['cancelar', 'cancelamento'])) {
+        if (preg_match('/\bcancel(a|ar|amento)\b/', $text) === 1) {
             return 'cancelar_agendamento';
         }
 

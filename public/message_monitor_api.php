@@ -71,6 +71,60 @@ function mm_decode_payload(?string $rawPayload): array
     return is_array($decoded) ? $decoded : [];
 }
 
+function mm_provider_label(string $provider): string
+{
+    return match (strtolower(trim($provider))) {
+        'papi' => 'PAPI',
+        default => 'Evolution',
+    };
+}
+
+function mm_extract_provider(array $row): string
+{
+    $provider = strtolower(trim((string) ($row['provider'] ?? '')));
+
+    if ($provider !== '') {
+        return $provider;
+    }
+
+    $payload = mm_decode_payload($row['last_raw_payload'] ?? $row['raw_payload'] ?? null);
+    $candidates = [
+        $payload['_meta']['provider'] ?? null,
+        $payload['provider'] ?? null,
+        $payload['payload']['provider'] ?? null,
+        $payload['body']['provider'] ?? null,
+    ];
+
+    foreach ($candidates as $candidate) {
+        if (is_string($candidate) && trim($candidate) !== '') {
+            return strtolower(trim($candidate));
+        }
+    }
+
+    return 'evolution';
+}
+
+function mm_conversation_key(string $provider, string $phone): string
+{
+    return strtolower(trim($provider)) . ':' . (preg_replace('/\D+/', '', $phone) ?: '');
+}
+
+function mm_parse_conversation_key(string $key): array
+{
+    $key = trim($key);
+
+    if ($key === '' || !str_contains($key, ':')) {
+        return ['provider' => '', 'phone' => ''];
+    }
+
+    [$provider, $phone] = explode(':', $key, 2);
+
+    return [
+        'provider' => strtolower(trim($provider)),
+        'phone' => preg_replace('/\D+/', '', $phone) ?: '',
+    ];
+}
+
 function mm_extract_send_status(array $payload): string
 {
     $sendResult = is_array($payload['send_result'] ?? null) ? $payload['send_result'] : null;
@@ -168,10 +222,12 @@ function mm_ensure_monitor_tables(PDO $pdo): void
 {
     $pdo->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS message_monitor_conversations (
-    phone VARCHAR(30) NOT NULL PRIMARY KEY,
+    provider VARCHAR(20) NOT NULL DEFAULT 'evolution',
+    phone VARCHAR(30) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'active',
     last_read_message_id INT NOT NULL DEFAULT 0,
-    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider, phone)
 );
 SQL);
 }
@@ -201,12 +257,15 @@ function mm_filter_conversations(array $conversations, string $view): array
     }));
 }
 
-function mm_upsert_conversation_state(PDO $pdo, string $phone, ?string $status = null, ?int $lastReadMessageId = null): void
+function mm_upsert_conversation_state(PDO $pdo, string $provider, string $phone, ?string $status = null, ?int $lastReadMessageId = null): void
 {
-    $fields = ['phone'];
-    $values = [':phone'];
+    $fields = ['provider', 'phone'];
+    $values = [':provider', ':phone'];
     $updates = [];
-    $params = ['phone' => $phone];
+    $params = [
+        'provider' => strtolower(trim($provider)),
+        'phone' => $phone,
+    ];
 
     if ($status !== null) {
         $fields[] = 'status';
@@ -237,39 +296,42 @@ function mm_upsert_conversation_state(PDO $pdo, string $phone, ?string $status =
     $statement->execute($params);
 }
 
-function mm_latest_incoming_message_id(PDO $pdo, string $phone): int
+function mm_latest_incoming_message_id(PDO $pdo, string $provider, string $phone): int
 {
-    $statement = $pdo->prepare("SELECT MAX(id) FROM message_logs WHERE phone = :phone AND direction = 'in'");
-    $statement->execute(['phone' => $phone]);
+    $statement = $pdo->prepare("SELECT MAX(id) FROM message_logs WHERE provider = :provider AND phone = :phone AND direction = 'in'");
+    $statement->execute([
+        'provider' => strtolower(trim($provider)),
+        'phone' => $phone,
+    ]);
 
     return max(0, (int) $statement->fetchColumn());
 }
 
-function mm_apply_conversation_action(PDO $pdo, string $phone, string $action): string
+function mm_apply_conversation_action(PDO $pdo, string $provider, string $phone, string $action): string
 {
     return match ($action) {
-        'mark_read' => (function () use ($pdo, $phone): string {
-            mm_upsert_conversation_state($pdo, $phone, null, mm_latest_incoming_message_id($pdo, $phone));
+        'mark_read' => (function () use ($pdo, $provider, $phone): string {
+            mm_upsert_conversation_state($pdo, $provider, $phone, null, mm_latest_incoming_message_id($pdo, $provider, $phone));
             return 'Conversa marcada como lida.';
         })(),
-        'mark_unread' => (function () use ($pdo, $phone): string {
-            $latestIncomingId = mm_latest_incoming_message_id($pdo, $phone);
+        'mark_unread' => (function () use ($pdo, $provider, $phone): string {
+            $latestIncomingId = mm_latest_incoming_message_id($pdo, $provider, $phone);
             if ($latestIncomingId < 1) {
                 throw new RuntimeException('Nao ha mensagem recebida para marcar como nao lida.');
             }
-            mm_upsert_conversation_state($pdo, $phone, null, max(0, $latestIncomingId - 1));
+            mm_upsert_conversation_state($pdo, $provider, $phone, null, max(0, $latestIncomingId - 1));
             return 'Conversa marcada como nao lida.';
         })(),
-        'archive' => (function () use ($pdo, $phone): string {
-            mm_upsert_conversation_state($pdo, $phone, 'archived', null);
+        'archive' => (function () use ($pdo, $provider, $phone): string {
+            mm_upsert_conversation_state($pdo, $provider, $phone, 'archived', null);
             return 'Conversa arquivada.';
         })(),
-        'inactivate' => (function () use ($pdo, $phone): string {
-            mm_upsert_conversation_state($pdo, $phone, 'inactive', null);
+        'inactivate' => (function () use ($pdo, $provider, $phone): string {
+            mm_upsert_conversation_state($pdo, $provider, $phone, 'inactive', null);
             return 'Conversa movida para inativas.';
         })(),
-        'activate' => (function () use ($pdo, $phone): string {
-            mm_upsert_conversation_state($pdo, $phone, 'active', null);
+        'activate' => (function () use ($pdo, $provider, $phone): string {
+            mm_upsert_conversation_state($pdo, $provider, $phone, 'active', null);
             return 'Conversa movida para ativas.';
         })(),
         default => throw new RuntimeException('Acao de conversa invalida.'),
@@ -278,57 +340,90 @@ function mm_apply_conversation_action(PDO $pdo, string $phone, string $action): 
 
 function mm_make_whatsapp_service(): WhatsAppService
 {
-    return new WhatsAppService(
-        new HttpClient(),
-        (string) config('services.whatsapp.base_url', ''),
-        (string) config('services.whatsapp.instance', ''),
-        (string) config('services.whatsapp.api_key', ''),
-        (bool) config('services.whatsapp.send_enabled', false),
-        (bool) config('services.whatsapp.split_messages', true),
-        (int) config('services.whatsapp.split_max_length', 700),
-        (int) config('services.whatsapp.split_delay_ms', 400),
-        (bool) config('services.whatsapp.typing_enabled', false),
-        (int) config('services.whatsapp.typing_delay_ms', 1200),
-        (bool) config('services.whatsapp.typing_each_chunk', true)
-    );
+    return WhatsAppService::fromConfig(new HttpClient(), (array) config('services.whatsapp', []));
 }
 
-function mm_load_data(MessageLogService $messageLogService, string $search, string $selectedPhone, int $conversationLimit, int $messageLimit, string $view): array
+function mm_enabled_providers(WhatsAppService $whatsAppService): array
+{
+    return [
+        'evolution' => $whatsAppService->isEnabled('evolution'),
+        'papi' => $whatsAppService->isEnabled('papi'),
+    ];
+}
+
+function mm_available_provider_options(array $enabledProviders): array
+{
+    $options = [];
+
+    foreach (['evolution', 'papi'] as $provider) {
+        if (($enabledProviders[$provider] ?? false) === true) {
+            $options[] = $provider;
+        }
+    }
+
+    if ($options === []) {
+        $options[] = (string) config('services.whatsapp.default_provider', config('services.whatsapp.provider', 'evolution'));
+    }
+
+    return array_values(array_unique($options));
+}
+
+function mm_load_data(
+    MessageLogService $messageLogService,
+    string $search,
+    string $selectedPhone,
+    string $selectedProvider,
+    int $conversationLimit,
+    int $messageLimit,
+    string $view,
+    array $enabledProviders
+): array
 {
     $conversations = mm_filter_conversations(
         $messageLogService->findConversations($conversationLimit, $search),
         $view
     );
 
-    if ($selectedPhone === '' && $conversations !== []) {
+    if (($enabledProviders['evolution'] ?? false) !== true || ($enabledProviders['papi'] ?? false) !== true) {
+        $conversations = array_values(array_filter($conversations, static function (array $conversation) use ($enabledProviders): bool {
+            $provider = mm_extract_provider($conversation);
+            return ($enabledProviders[$provider] ?? false) === true;
+        }));
+    }
+
+    if (($selectedPhone === '' || $selectedProvider === '') && $conversations !== []) {
         $selectedPhone = (string) ($conversations[0]['phone'] ?? '');
+        $selectedProvider = mm_extract_provider($conversations[0]);
     }
 
     $selectedConversation = null;
 
     foreach ($conversations as $conversation) {
-        if ((string) ($conversation['phone'] ?? '') === $selectedPhone) {
+        if ((string) ($conversation['phone'] ?? '') === $selectedPhone && mm_extract_provider($conversation) === $selectedProvider) {
             $selectedConversation = $conversation;
             break;
         }
     }
 
-    if ($selectedPhone !== '' && $selectedConversation === null) {
+    if ($selectedPhone !== '' && $selectedProvider !== '' && $selectedConversation === null) {
         if ($conversations !== []) {
             $selectedConversation = $conversations[0];
             $selectedPhone = (string) ($selectedConversation['phone'] ?? '');
+            $selectedProvider = mm_extract_provider($selectedConversation);
         } else {
             $selectedPhone = '';
+            $selectedProvider = '';
         }
     }
 
-    $messages = $selectedPhone !== ''
-        ? $messageLogService->findMessagesByPhone($selectedPhone, $messageLimit)
+    $messages = $selectedPhone !== '' && $selectedProvider !== ''
+        ? $messageLogService->findMessagesByPhone($selectedPhone, $messageLimit, $selectedProvider)
         : [];
 
-    if ($selectedConversation === null && $selectedPhone !== '' && $messages !== []) {
+    if ($selectedConversation === null && $selectedPhone !== '' && $selectedProvider !== '' && $messages !== []) {
         $lastMessage = $messages[count($messages) - 1] ?? [];
         $selectedConversation = [
+            'provider' => $selectedProvider,
             'phone' => $selectedPhone,
             'last_message_at' => $lastMessage['created_at'] ?? null,
             'total_messages' => count($messages),
@@ -344,6 +439,8 @@ function mm_load_data(MessageLogService $messageLogService, string $search, stri
 
     return [
         'selected_phone' => $selectedPhone,
+        'selected_provider' => $selectedProvider,
+        'selected_key' => $selectedPhone !== '' && $selectedProvider !== '' ? mm_conversation_key($selectedProvider, $selectedPhone) : '',
         'current_view' => $view,
         'conversations' => $conversations,
         'selected_conversation' => $selectedConversation,
@@ -351,7 +448,7 @@ function mm_load_data(MessageLogService $messageLogService, string $search, stri
     ];
 }
 
-function mm_render_conversations(array $conversations, string $selectedPhone): string
+function mm_render_conversations(array $conversations, string $selectedKey): string
 {
     ob_start();
 
@@ -368,6 +465,8 @@ function mm_render_conversations(array $conversations, string $selectedPhone): s
 
     foreach ($conversations as $conversation) {
         $phone = (string) ($conversation['phone'] ?? '');
+        $provider = mm_extract_provider($conversation);
+        $conversationKey = mm_conversation_key($provider, $phone);
         $name = mm_extract_name($conversation);
         $preview = mm_summarize_message($conversation['last_message_text'] ?? null, (string) ($conversation['last_message_type'] ?? 'unknown'));
         $avatar = mb_strtoupper(mb_substr($name, 0, 1));
@@ -376,7 +475,7 @@ function mm_render_conversations(array $conversations, string $selectedPhone): s
         $statusClass = $status === 'archived' ? ' is-archived' : ($status === 'inactive' ? ' is-inactive' : '');
         $unreadCount = (int) ($conversation['unread_count'] ?? 0);
         ?>
-        <a class="conversation-item<?= $phone === $selectedPhone ? ' is-active' : '' ?><?= $unreadCount > 0 ? ' has-unread' : '' ?><?= mm_e($statusClass) ?>" href="#" data-phone="<?= mm_e($phone) ?>">
+        <a class="conversation-item<?= $conversationKey === $selectedKey ? ' is-active' : '' ?><?= $unreadCount > 0 ? ' has-unread' : '' ?><?= mm_e($statusClass) ?>" href="#" data-phone="<?= mm_e($phone) ?>" data-provider="<?= mm_e($provider) ?>" data-conversation-key="<?= mm_e($conversationKey) ?>">
             <span class="avatar"><?= mm_e($avatar !== '' ? $avatar : '#') ?></span>
             <span class="conversation-main">
                 <span class="conversation-top">
@@ -389,7 +488,7 @@ function mm_render_conversations(array $conversations, string $selectedPhone): s
                     </span>
                 </span>
                 <span class="conversation-meta-row">
-                    <span class="conversation-meta"><?= mm_e(mm_format_phone($phone)) ?></span>
+                    <span class="conversation-meta"><?= mm_e(mm_format_phone($phone)) ?> · <?= mm_e(mm_provider_label($provider)) ?></span>
                     <?php if ($status !== 'active'): ?>
                         <span class="conversation-status-badge<?= mm_e($statusClass) ?>"><?= mm_e($statusLabel) ?></span>
                     <?php endif; ?>
@@ -423,15 +522,17 @@ function mm_render_header(?array $selectedConversation): string
     $status = (string) ($selectedConversation['conversation_status'] ?? 'active');
     $unreadCount = (int) ($selectedConversation['unread_count'] ?? 0);
     $hasIncoming = (int) ($selectedConversation['incoming_messages'] ?? 0) > 0;
+    $provider = mm_extract_provider($selectedConversation);
     ?>
     <div class="thread-header-card">
         <div class="thread-header-main">
             <span class="thread-avatar"><?= mm_e($selectedAvatar !== '' ? $selectedAvatar : '#') ?></span>
             <div class="thread-header-copy">
                 <strong><?= mm_e($selectedName) ?></strong>
-                <span><?= mm_e(mm_format_phone((string) ($selectedConversation['phone'] ?? ''))) ?></span>
+                <span><?= mm_e(mm_format_phone((string) ($selectedConversation['phone'] ?? ''))) ?> · <?= mm_e(mm_provider_label($provider)) ?></span>
                 <div class="thread-badges">
                     <span class="thread-pill is-status status-<?= mm_e($status) ?>"><?= mm_e($status === 'archived' ? 'Arquivada' : ($status === 'inactive' ? 'Inativa' : 'Ativa')) ?></span>
+                    <span class="thread-pill is-status"><?= mm_e(mm_provider_label($provider)) ?></span>
                     <span class="thread-pill is-read-state<?= $unreadCount > 0 ? ' is-unread' : '' ?>"><?= $unreadCount > 0 ? $unreadCount . ' nao lida' . ($unreadCount > 1 ? 's' : '') : 'Lida' ?></span>
                 </div>
                 <div class="thread-actions">
@@ -490,6 +591,7 @@ function mm_render_feed(?array $selectedConversation, array $messages): string
         $displayText = mm_format_message_for_display($text, $isOutgoing);
         $payload = mm_decode_payload($message['raw_payload'] ?? null);
         $sendStatus = $isOutgoing ? mm_extract_send_status($payload) : '';
+        $provider = mm_extract_provider($message);
         $payloadJson = $payload === []
             ? trim((string) ($message['raw_payload'] ?? ''))
             : json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -497,7 +599,7 @@ function mm_render_feed(?array $selectedConversation, array $messages): string
         <article class="message-row<?= $isOutgoing ? ' outgoing' : ' incoming' ?>">
             <div class="message-bubble">
                 <div class="message-top">
-                    <span><?= $isOutgoing ? 'Robo' : 'Cliente' ?></span>
+                    <span><?= $isOutgoing ? 'Robo' : 'Cliente' ?> · <?= mm_e(mm_provider_label($provider)) ?></span>
                     <span>
                         <?= mm_e(mm_message_badge((string) ($message['message_type'] ?? 'unknown'))) ?>
                         <?php if ($isOutgoing): ?>
@@ -534,14 +636,17 @@ function mm_render_feed(?array $selectedConversation, array $messages): string
     return (string) ob_get_clean();
 }
 
-function mm_render_composer(string $selectedPhone, bool $sendEnabled): string
+function mm_render_composer(string $selectedPhone, string $selectedProvider, array $enabledProviders): string
 {
-    $isDisabled = $selectedPhone === '' || !$sendEnabled;
+    $availableProviders = mm_available_provider_options($enabledProviders);
+    $selectedProvider = $selectedProvider !== '' ? $selectedProvider : ($availableProviders[0] ?? 'evolution');
+    $providerEnabled = (bool) ($enabledProviders[$selectedProvider] ?? false);
+    $isDisabled = $selectedPhone === '' || !$providerEnabled;
     $placeholder = $selectedPhone === ''
         ? 'Selecione uma conversa para responder.'
         : 'Digite uma mensagem para enviar manualmente.';
-    $hint = !$sendEnabled
-        ? 'Envio manual desabilitado. Ative WHATSAPP_SEND_ENABLED no .env para mandar mensagens daqui.'
+    $hint = !$providerEnabled
+        ? 'Envio manual desabilitado para o provider selecionado.'
         : ($selectedPhone === '' ? 'Escolha uma conversa na lista para habilitar o envio.' : 'Mensagem enviada por aqui tambem entra no historico.');
 
     ob_start();
@@ -549,7 +654,14 @@ function mm_render_composer(string $selectedPhone, bool $sendEnabled): string
     <form id="send-form" class="composer-form">
         <input type="hidden" name="phone" value="<?= mm_e($selectedPhone) ?>">
         <div class="composer-fields">
-            <textarea id="send-message" name="message" rows="3" placeholder="<?= mm_e($placeholder) ?>"<?= $isDisabled ? ' disabled' : '' ?>></textarea>
+            <div class="composer-stack">
+                <select name="provider" class="composer-provider"<?= $selectedPhone === '' ? ' disabled' : '' ?>>
+                    <?php foreach ($availableProviders as $provider): ?>
+                        <option value="<?= mm_e($provider) ?>"<?= $provider === $selectedProvider ? ' selected' : '' ?>><?= mm_e(mm_provider_label($provider)) ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <textarea id="send-message" name="message" rows="3" placeholder="<?= mm_e($placeholder) ?>"<?= $isDisabled ? ' disabled' : '' ?>></textarea>
+            </div>
             <button type="submit" class="send-button"<?= $isDisabled ? ' disabled' : '' ?>>Enviar</button>
         </div>
         <div class="composer-hint" id="composer-hint"><?= mm_e($hint) ?></div>
@@ -560,20 +672,24 @@ function mm_render_composer(string $selectedPhone, bool $sendEnabled): string
     return (string) ob_get_clean();
 }
 
-function mm_build_snapshot(array $monitorData, bool $sendEnabled): array
+function mm_build_snapshot(array $monitorData, array $enabledProviders): array
 {
     return [
         'selected_phone' => $monitorData['selected_phone'],
+        'selected_provider' => $monitorData['selected_provider'] ?? '',
+        'selected_key' => $monitorData['selected_key'] ?? '',
         'conversations_count' => count($monitorData['conversations']),
-        'conversation_list_html' => mm_render_conversations($monitorData['conversations'], $monitorData['selected_phone']),
+        'conversation_list_html' => mm_render_conversations($monitorData['conversations'], (string) ($monitorData['selected_key'] ?? '')),
         'thread_header_html' => mm_render_header($monitorData['selected_conversation']),
         'message_feed_html' => mm_render_feed($monitorData['selected_conversation'], $monitorData['messages']),
-        'composer_html' => mm_render_composer($monitorData['selected_phone'], $sendEnabled),
+        'composer_html' => mm_render_composer((string) $monitorData['selected_phone'], (string) ($monitorData['selected_provider'] ?? ''), $enabledProviders),
         'refreshed_at' => (new DateTimeImmutable())->format('d/m/Y H:i:s'),
-        'send_enabled' => $sendEnabled,
+        'send_enabled' => in_array(true, $enabledProviders, true),
+        'enabled_providers' => $enabledProviders,
         'current_view' => $monitorData['current_view'] ?? 'ativas',
     ];
-}$request = Request::capture();
+}
+$request = Request::capture();
 $remoteAddress = (string) $request->server('REMOTE_ADDR', '');
 $isLocalRequest = in_array($remoteAddress, ['127.0.0.1', '::1'], true);
 $adminToken = (string) config('services.session.admin_token', '');
@@ -590,6 +706,17 @@ if (!$isLocalRequest && ($adminToken === '' || !hash_equals($adminToken, $provid
 $action = strtolower((string) ($request->query('action', $request->input('action', 'refresh'))));
 $search = trim((string) ($request->query('search', $request->input('search', ''))));
 $selectedPhone = preg_replace('/\D+/', '', (string) ($request->query('phone', $request->input('phone', '')))) ?: '';
+$selectedProvider = strtolower(trim((string) ($request->query('provider', $request->input('provider', '')))));
+$selectedConversationKey = trim((string) ($request->query('conversation_key', $request->input('conversation_key', ''))));
+if ($selectedConversationKey !== '') {
+    $parsedConversation = mm_parse_conversation_key($selectedConversationKey);
+    if ($parsedConversation['provider'] !== '') {
+        $selectedProvider = $parsedConversation['provider'];
+    }
+    if ($parsedConversation['phone'] !== '') {
+        $selectedPhone = $parsedConversation['phone'];
+    }
+}
 $view = mm_normalize_view((string) ($request->query('view', $request->input('view', 'ativas'))));
 $conversationAction = trim((string) $request->input('conversation_action', $request->query('conversation_action', '')));
 $conversationLimit = max(1, min((int) $request->query('conversation_limit', 60), 100));
@@ -601,7 +728,7 @@ try {
     mm_ensure_monitor_tables($pdo);
     $messageLogService = new MessageLogService(new PdoMessageLogRepository($pdo));
     $whatsAppService = mm_make_whatsapp_service();
-    $sendEnabled = $whatsAppService->isEnabled();
+    $enabledProviders = mm_enabled_providers($whatsAppService);
 
     if ($action === 'delete' && $request->method() === 'POST') {
         if ($messageId <= 0) {
@@ -622,19 +749,19 @@ try {
             return;
         }
 
-        $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $conversationLimit, $messageLimit, $view);
+        $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $selectedProvider, $conversationLimit, $messageLimit, $view, $enabledProviders);
 
         Response::json([
             'ok' => true,
             'message' => 'Mensagem excluida com sucesso.',
             'deleted_rows' => $deleted,
-            'snapshot' => mm_build_snapshot($monitorData, $sendEnabled),
+            'snapshot' => mm_build_snapshot($monitorData, $enabledProviders),
         ])->send();
         return;
     }
 
     if ($action === 'conversation' && $request->method() === 'POST') {
-        if ($selectedPhone === '') {
+        if ($selectedPhone === '' || $selectedProvider === '') {
             Response::json([
                 'ok' => false,
                 'message' => 'Selecione uma conversa antes de aplicar uma acao.',
@@ -650,18 +777,19 @@ try {
             return;
         }
 
-        $message = mm_apply_conversation_action($pdo, $selectedPhone, $conversationAction);
-        $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $conversationLimit, $messageLimit, $view);
+        $message = mm_apply_conversation_action($pdo, $selectedProvider, $selectedPhone, $conversationAction);
+        $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $selectedProvider, $conversationLimit, $messageLimit, $view, $enabledProviders);
 
         Response::json([
             'ok' => true,
             'message' => $message,
-            'snapshot' => mm_build_snapshot($monitorData, $sendEnabled),
+            'snapshot' => mm_build_snapshot($monitorData, $enabledProviders),
         ])->send();
         return;
     }
     if ($action === 'send' && $request->method() === 'POST') {
         $text = trim((string) $request->input('message', ''));
+        $provider = strtolower(trim((string) $request->input('provider', $selectedProvider !== '' ? $selectedProvider : (string) config('services.whatsapp.default_provider', config('services.whatsapp.provider', 'evolution')))));
 
         if ($selectedPhone === '') {
             Response::json([
@@ -679,16 +807,16 @@ try {
             return;
         }
 
-        if (!$sendEnabled) {
+        if (($enabledProviders[$provider] ?? false) !== true) {
             Response::json([
                 'ok' => false,
-                'message' => 'O envio manual esta desabilitado no ambiente atual.',
+                'message' => 'O envio manual esta desabilitado para o provider selecionado.',
             ], 409)->send();
             return;
         }
 
         try {
-            $sendResult = $whatsAppService->sendText($selectedPhone, $text);
+            $sendResult = $whatsAppService->sendText($selectedPhone, $text, $provider);
         } catch (Throwable $sendException) {
             Response::json([
                 'ok' => false,
@@ -696,6 +824,7 @@ try {
                 'send_result' => [
                     'status' => 'error',
                     'error' => $sendException->getMessage(),
+                    'provider' => $provider,
                 ],
             ], 502)->send();
             return;
@@ -714,25 +843,26 @@ try {
 
         $messageLogService->logManualOutgoing($selectedPhone, $text, [
             'source' => 'message_monitor_manual_send',
+            'provider' => $provider,
             'send_result' => $sendResult,
         ]);
 
-        $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $conversationLimit, $messageLimit, $view);
+        $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $provider, $conversationLimit, $messageLimit, $view, $enabledProviders);
 
         Response::json([
             'ok' => true,
             'message' => 'Mensagem enviada com sucesso.',
             'send_result' => $sendResult,
-            'snapshot' => mm_build_snapshot($monitorData, $sendEnabled),
+            'snapshot' => mm_build_snapshot($monitorData, $enabledProviders),
         ])->send();
         return;
     }
 
-    $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $conversationLimit, $messageLimit, $view);
+    $monitorData = mm_load_data($messageLogService, $search, $selectedPhone, $selectedProvider, $conversationLimit, $messageLimit, $view, $enabledProviders);
 
     Response::json([
         'ok' => true,
-        'snapshot' => mm_build_snapshot($monitorData, $sendEnabled),
+        'snapshot' => mm_build_snapshot($monitorData, $enabledProviders),
     ])->send();
 } catch (Throwable $exception) {
     Response::json([

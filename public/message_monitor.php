@@ -215,6 +215,7 @@ if (!$isLocalRequest && ($adminToken === '' || !hash_equals($adminToken, $provid
 
 $search = trim((string) $request->query('search', ''));
 $selectedPhone = preg_replace('/\D+/', '', (string) $request->query('phone', '')) ?: '';
+$selectedProvider = strtolower(trim((string) $request->query('provider', '')));
 $view = normalizeMonitorView((string) $request->query('view', 'ativas'));
 $conversationLimit = max(1, min((int) $request->query('conversation_limit', 60), 100));
 $messageLimit = max(1, min((int) $request->query('message_limit', 200), 500));
@@ -265,6 +266,9 @@ $query = $_GET;
 $query['search'] = $search;
 if ($selectedPhone !== '') {
     $query['phone'] = $selectedPhone;
+}
+if ($selectedProvider !== '') {
+    $query['provider'] = $selectedProvider;
 }
 $query['view'] = $view;
 if ($providedToken !== '') {
@@ -371,6 +375,32 @@ $refreshUrl = '?' . http_build_query($query);
         .header-meta {
             text-align: right;
             font-size: 0.92rem;
+        }
+
+        .header-links {
+            margin-top: 12px;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .header-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 40px;
+            padding: 0 14px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.14);
+            color: #f7fffb;
+            text-decoration: none;
+            font-weight: 700;
+            transition: background 120ms ease, transform 120ms ease;
+        }
+
+        .header-link:hover {
+            background: rgba(255, 255, 255, 0.22);
         }
 
         .layout {
@@ -1036,6 +1066,24 @@ $refreshUrl = '?' . http_build_query($query);
             align-items: end;
         }
 
+        .composer-stack {
+            display: grid;
+            gap: 8px;
+            min-width: 0;
+        }
+
+        .composer-provider {
+            width: 100%;
+            height: 42px;
+            border: 1px solid rgba(31, 44, 52, 0.12);
+            border-radius: 14px;
+            padding: 0 12px;
+            font: inherit;
+            color: var(--text-main);
+            background: #fff;
+            outline: none;
+        }
+
         .composer-fields textarea {
             width: 100%;
             min-height: 74px;
@@ -1632,6 +1680,12 @@ $refreshUrl = '?' . http_build_query($query);
                 gap: 8px;
             }
 
+            .composer-provider {
+                height: 40px;
+                border-radius: 12px;
+                font-size: 16px;
+            }
+
             .composer-fields textarea {
                 min-height: 60px;
                 padding: 12px;
@@ -1669,6 +1723,9 @@ $refreshUrl = '?' . http_build_query($query);
                     <span>Atualizacao automatica a cada <?= $refreshSeconds ?> segundos</span>
                 </div>
                 <p id="last-sync">Ultima sincronizacao: <?= e((new DateTimeImmutable())->format('d/m/Y H:i:s')) ?></p>
+                <div class="header-links">
+                    <a class="header-link" href="settings_admin.php">Configurações</a>
+                </div>
             </div>
         </header>
 
@@ -1882,6 +1939,7 @@ $refreshUrl = '?' . http_build_query($query);
         (() => {
             const state = {
                 selectedPhone: <?= json_encode($selectedPhone, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?> || '',
+                selectedProvider: <?= json_encode($selectedProvider, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?> || '',
                 search: <?= json_encode($search, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?> || '',
                 view: <?= json_encode($view, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?> || 'ativas',
                 token: <?= json_encode($providedToken, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?> || '',
@@ -1941,6 +1999,7 @@ $refreshUrl = '?' . http_build_query($query);
                 params.set('conversation_limit', '60');
                 params.set('message_limit', '200');
                 if (state.selectedPhone) params.set('phone', state.selectedPhone);
+                if (state.selectedProvider) params.set('provider', state.selectedProvider);
                 if (state.search) params.set('search', state.search);
                 if (state.view) params.set('view', state.view);
                 if (state.token) params.set('token', state.token);
@@ -1950,6 +2009,7 @@ $refreshUrl = '?' . http_build_query($query);
             function syncUrl() {
                 const url = new URL(window.location.href);
                 if (state.selectedPhone) url.searchParams.set('phone', state.selectedPhone); else url.searchParams.delete('phone');
+                if (state.selectedProvider) url.searchParams.set('provider', state.selectedProvider); else url.searchParams.delete('provider');
                 if (state.search) url.searchParams.set('search', state.search); else url.searchParams.delete('search');
                 if (state.view) url.searchParams.set('view', state.view); else url.searchParams.delete('view');
                 if (state.token) url.searchParams.set('token', state.token); else url.searchParams.delete('token');
@@ -2008,6 +2068,10 @@ $refreshUrl = '?' . http_build_query($query);
                     state.selectedPhone = snapshot.selected_phone;
                 }
 
+                if (typeof snapshot.selected_provider === 'string') {
+                    state.selectedProvider = snapshot.selected_provider;
+                }
+
                 if (typeof snapshot.current_view === 'string') {
                     state.view = snapshot.current_view;
                 }
@@ -2054,8 +2118,10 @@ $refreshUrl = '?' . http_build_query($query);
                 if (state.sending || state.deletingMessageId !== null) return;
 
                 const textarea = form.querySelector('textarea[name="message"]');
+                const providerSelect = form.querySelector('select[name="provider"]');
                 const button = form.querySelector('button[type="submit"]');
                 const message = textarea ? textarea.value.trim() : '';
+                const provider = providerSelect ? providerSelect.value.trim() : (state.selectedProvider || '');
 
                 if (!message) {
                     setFeedback('Digite uma mensagem antes de enviar.', 'error');
@@ -2072,6 +2138,7 @@ $refreshUrl = '?' . http_build_query($query);
                     const body = new URLSearchParams();
                     body.set('action', 'send');
                     body.set('phone', state.selectedPhone || '');
+                    body.set('provider', provider);
                     body.set('search', state.search || '');
                     body.set('view', state.view || 'ativas');
                     body.set('message', message);
@@ -2088,6 +2155,7 @@ $refreshUrl = '?' . http_build_query($query);
                     const payload = await response.json();
                     if (!response.ok || !payload.ok) throw new Error(payload.message || 'Falha ao enviar a mensagem.');
                     if (textarea) textarea.value = '';
+                    state.selectedProvider = provider;
                     applySnapshot(payload.snapshot, { forceBottom: true, openThreadOnMobile: true });
                     setFeedback(payload.message || 'Mensagem enviada com sucesso.', 'success');
                     if (liveStatus) liveStatus.textContent = 'Mensagem enviada sem recarregar a pagina.';
@@ -2120,6 +2188,7 @@ $refreshUrl = '?' . http_build_query($query);
                     body.set('action', 'delete');
                     body.set('message_id', String(messageId));
                     body.set('phone', state.selectedPhone || '');
+                    body.set('provider', state.selectedProvider || '');
                     body.set('search', state.search || '');
                     body.set('view', state.view || 'ativas');
                     if (state.token) body.set('token', state.token);
@@ -2161,6 +2230,7 @@ $refreshUrl = '?' . http_build_query($query);
                     body.set('action', 'conversation');
                     body.set('conversation_action', action);
                     body.set('phone', state.selectedPhone || '');
+                    body.set('provider', state.selectedProvider || '');
                     body.set('search', state.search || '');
                     body.set('view', state.view || 'ativas');
                     if (state.token) body.set('token', state.token);
@@ -2203,6 +2273,7 @@ $refreshUrl = '?' . http_build_query($query);
                     event.preventDefault();
                     state.search = searchInput ? searchInput.value.trim() : '';
                     state.selectedPhone = '';
+                    state.selectedProvider = '';
                     state.mobileThreadOpen = false;
                     markInteraction(3000);
                     refreshData({ manual: true });
@@ -2215,6 +2286,7 @@ $refreshUrl = '?' . http_build_query($query);
                     if (searchInput) searchInput.value = '';
                     state.search = '';
                     state.selectedPhone = '';
+                    state.selectedProvider = '';
                     state.mobileThreadOpen = false;
                     markInteraction(3000);
                     refreshData({ manual: true });
@@ -2228,6 +2300,7 @@ $refreshUrl = '?' . http_build_query($query);
                     event.preventDefault();
                     state.view = chip.getAttribute('data-view') || 'ativas';
                     state.selectedPhone = '';
+                    state.selectedProvider = '';
                     state.mobileThreadOpen = false;
                     updateViewButtons();
                     markInteraction(3000);
@@ -2241,6 +2314,7 @@ $refreshUrl = '?' . http_build_query($query);
                     if (!item) return;
                     event.preventDefault();
                     state.selectedPhone = item.getAttribute('data-phone') || '';
+                    state.selectedProvider = item.getAttribute('data-provider') || '';
                     state.mobileThreadOpen = true;
                     markInteraction(3000);
                     updateMobileView();

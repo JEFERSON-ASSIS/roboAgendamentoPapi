@@ -3,90 +3,55 @@
 namespace App\Service;
 
 use App\DTO\IncomingMessageDTO;
+use App\Service\WhatsApp\EvolutionIncomingWebhookNormalizer;
+use App\Service\WhatsApp\IncomingWebhookNormalizerInterface;
+use App\Service\WhatsApp\IncomingWebhookProviderResolver;
+use App\Service\WhatsApp\IncomingWebhookProviderResolverInterface;
+use App\Service\WhatsApp\PapiIncomingWebhookNormalizer;
+use RuntimeException;
 
 class MessageNormalizer
 {
-    public function normalize(array $payload): IncomingMessageDTO
-    {
-        $body = $payload['body'] ?? $payload;
-        $data = $body['data'] ?? [];
-        $message = $data['message'] ?? [];
-        $key = $data['key'] ?? [];
+    private readonly IncomingWebhookProviderResolverInterface $providerResolver;
 
-        $phone = preg_replace('/\D+/', '', (string) ($key['remoteJid'] ?? '')) ?: '';
-        $pushName = $data['pushName'] ?? $body['pushName'] ?? null;
-        $messageType = $this->detectMessageType($message);
-        $messageText = $this->extractMessageText($message, $messageType);
-        $mediaUrl = $this->extractMediaUrl($message, $messageType);
+    /** @var array<string, IncomingWebhookNormalizerInterface> */
+    private array $normalizers = [];
 
-        return new IncomingMessageDTO(
-            phone: $phone,
-            messageType: $messageType,
-            message: $messageText,
-            mediaUrl: $mediaUrl,
-            pushName: is_string($pushName) ? trim($pushName) : null,
-            payload: $payload
-        );
-    }
+    public function __construct(
+        ?IncomingWebhookProviderResolverInterface $providerResolver = null,
+        array $normalizers = []
+    ) {
+        $defaultProvider = (string) config('services.whatsapp.default_provider', config('services.whatsapp.provider', 'evolution'));
+        $queryKey = (string) config('services.whatsapp.incoming_hint_query_key', 'provider');
+        $mixedMode = (bool) config('services.whatsapp.mixed_webhook_mode', false);
 
-    private function detectMessageType(array $message): string
-    {
-        $types = [
-            'conversation' => 'text',
-            'extendedTextMessage' => 'text',
-            'reactionMessage' => 'reaction',
-            'encReactionMessage' => 'reaction',
-            'audioMessage' => 'audio',
-            'imageMessage' => 'image',
-            'videoMessage' => 'video',
-            'documentMessage' => 'document',
-            'stickerMessage' => 'sticker',
+        $this->providerResolver = $providerResolver ?? new IncomingWebhookProviderResolver($defaultProvider, $queryKey, $mixedMode);
+        $normalizers = $normalizers !== [] ? $normalizers : [
+            new EvolutionIncomingWebhookNormalizer(),
+            new PapiIncomingWebhookNormalizer(),
         ];
 
-        foreach ($types as $key => $type) {
-            if (array_key_exists($key, $message)) {
-                return $type;
+        foreach ($normalizers as $normalizer) {
+            if ($normalizer instanceof IncomingWebhookNormalizerInterface) {
+                $this->normalizers[$normalizer->providerName()] = $normalizer;
             }
         }
-
-        return 'unknown';
     }
 
-    private function extractMessageText(array $message, string $messageType): ?string
+    public function normalize(array $payload, array $headers = [], array $query = []): IncomingMessageDTO
     {
-        return match ($messageType) {
-            'text' => $message['conversation']
-                ?? $message['extendedTextMessage']['text']
-                ?? null,
-            'reaction' => $message['reactionMessage']['text']
-                ?? $message['reactionMessage']['emoji']
-                ?? $message['encReactionMessage']['text']
-                ?? $message['encReactionMessage']['emoji']
-                ?? null,
-            default => null,
-        };
+        $provider = $this->providerResolver->resolve($payload, $headers, $query);
+        $normalizer = $this->normalizers[$provider] ?? $this->normalizers['evolution'] ?? null;
+
+        if ($normalizer === null) {
+            throw new RuntimeException('Nenhum normalizer de WhatsApp foi configurado.');
+        }
+
+        return $normalizer->normalize($payload, $headers, $query);
     }
 
-    private function extractMediaUrl(array $message, string $messageType): ?string
+    public function resolveProvider(array $payload, array $headers = [], array $query = []): string
     {
-        return match ($messageType) {
-            'audio' => $message['mediaUrl']
-                ?? $message['audioMessage']['mediaUrl']
-                ?? $message['audioMessage']['url']
-                ?? null,
-            'image' => $message['mediaUrl']
-                ?? $message['imageMessage']['mediaUrl']
-                ?? $message['imageMessage']['url']
-                ?? null,
-            'video' => $message['mediaUrl']
-                ?? $message['videoMessage']['mediaUrl']
-                ?? $message['videoMessage']['url']
-                ?? null,
-            'document' => $message['mediaUrl']
-                ?? $message['documentMessage']['mediaUrl']
-                ?? $message['documentMessage']['url']
-                ?? null,
-            default => null,
-        };
+        return $this->providerResolver->resolve($payload, $headers, $query);
     }
 }

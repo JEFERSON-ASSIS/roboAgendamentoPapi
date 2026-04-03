@@ -2,6 +2,7 @@
 
 namespace App\Domain\Conversation;
 
+use App\DTO\AssistantReplyDTO;
 use App\DTO\ConversationResultDTO;
 use App\DTO\FlowRecoveryDecisionDTO;
 use App\DTO\IncomingMessageDTO;
@@ -13,6 +14,9 @@ use App\Service\RestrictionRuleService;
 
 class AiOrchestrator
 {
+    private const RECEPTION_CONTACT_NAME = 'Recepção UBS Vida Nova (PSF02)';
+    private const RECEPTION_CONTACT_PHONE = '+5566992040540';
+    private const MAIN_MENU_FOOTER = "Se preferir atendimento humano, diga *humano* que eu te mando contato da recepção.\n\nA qualquer momento, digite *Sair* para encerrar este atendimento.";
     public function __construct(
         private readonly ConversationInterpreterInterface $interpreter,
         private readonly AgendaToolRegistry $toolRegistry,
@@ -31,7 +35,7 @@ class AiOrchestrator
         $isReactionAcknowledgement = $this->isReactionAcknowledgementMessage($message->message);
 
         if ($session->currentFlow === 'completed' && !$this->isShortAck($message->message) && !$this->isCourtesyMessage($message->message) && !$isReactionAcknowledgement) {
-            $session = SessionDTO::createEmpty($session->phone);
+            $session = SessionDTO::createEmpty($session->phone, $session->provider);
             $session = $this->mergeSessionData($session, $analysis->entities);
         }
 
@@ -80,6 +84,19 @@ class AiOrchestrator
             return $this->handleCpfChangeIntent($message, $session, $analysis->entities);
         }
 
+        if ($this->isHumanSupportRequest($message->message)) {
+            $reply = 'Se preferir atendimento humano, segue o contato da recepção:';
+
+            return new ConversationResultDTO(
+                $reply,
+                $session,
+                'human_support',
+                $analysis->entities,
+                [],
+                $this->receptionContactReply($reply)
+            );
+        }
+
         if ($session->currentFlow === 'idle') {
             if ($isReactionAcknowledgement) {
                 return new ConversationResultDTO(
@@ -92,7 +109,7 @@ class AiOrchestrator
 
             if ($this->isExternalReminderConfirmationMessage($message->message)) {
                 return new ConversationResultDTO(
-                    'Perfeito. Obrigado pela confirmacao. Se precisar de algo mais, e so me chamar.',
+                    'Perfeito. Obrigado pela confirmação. Se precisar de algo mais, é só me chamar.',
                     $session,
                     'external_reminder_confirmation',
                     $analysis->entities
@@ -100,7 +117,7 @@ class AiOrchestrator
             }
 
             if ($intent === 'choose_service') {
-                return new ConversationResultDTO($this->askForServiceChoice(), $session, $intent, $analysis->entities);
+                return new ConversationResultDTO($this->askForServiceChoice(), $session, $intent, $analysis->entities, [], $this->serviceChoiceReplyPayload());
             }
 
             if ($intent === 'menu' || $intent === 'unknown') {
@@ -108,7 +125,9 @@ class AiOrchestrator
                     $this->menuMessage($session, $hadReusableSession),
                     $session,
                     $intent,
-                    $analysis->entities
+                    $analysis->entities,
+                    [],
+                    $this->mainMenuReplyPayload($session, $hadReusableSession)
                 );
             }
 
@@ -141,7 +160,7 @@ class AiOrchestrator
 
         if ($this->isSchedulingFlow($session->currentFlow)) {
             if ($intent === 'choose_service') {
-                return new ConversationResultDTO($this->askForServiceChoice(), $session, $intent, $analysis->entities);
+                return new ConversationResultDTO($this->askForServiceChoice(), $session, $intent, $analysis->entities, [], $this->serviceChoiceReplyPayload());
             }
 
             if ($this->isSchedulingIntent($intent) && $this->canSwitchService($session)) {
@@ -155,7 +174,9 @@ class AiOrchestrator
             $this->menuMessage($session, $hadReusableSession),
             $session,
             $intent,
-            $analysis->entities
+            $analysis->entities,
+            [],
+            $this->mainMenuReplyPayload($session, $hadReusableSession)
         );
     }
 
@@ -206,7 +227,7 @@ class AiOrchestrator
                 $entities,
                 $toolCalls,
                 'awaiting_name',
-                'Perfeito. Agora me diga seu nome completo, por favor.',
+                'Perfeito. Agora me diga o *nome completo* de *quem* vai consultar, por favor.',
                 ['Jeferson Assis']
             );
         }
@@ -219,7 +240,7 @@ class AiOrchestrator
                 $entities,
                 $toolCalls,
                 'awaiting_phone',
-                'Obrigada. Agora me informe seu telefone com DDD, por favor.',
+                'Obrigada. Agora me informe o numero telefone com DDD, por favor.',
                 ['5566996553735']
             );
         }
@@ -300,7 +321,7 @@ class AiOrchestrator
             $context = $this->forgetStepAttempts($session->context, 'awaiting_date_choice');
             if (!$verification['confirmed']) {
                 $context = array_merge($context, ['pending_manual_review' => true, 'last_write_result' => $toolResult]);
-                $this->logger->warning('Agendamento criado sem confirmacao imediata na verificacao final.', [
+                $this->logger->warning('Agendamento criado sem confirmação imediata na verificação final.', [
                     'service' => $service,
                     'phone' => $session->phone,
                     'cpf' => $session->cpf,
@@ -402,15 +423,18 @@ class AiOrchestrator
             $context = $session->context;
             $context['blocked_cancel_id'] = (string) ($agendamento['id'] ?? '');
 
-            return new ConversationResultDTO(
-                "Encontrei um agendamento anterior com status de *Ausente* para este serviço.\n\n" .
+            $blockedPrompt = "Encontrei um agendamento anterior com status de *Ausente* para este serviço.\n\n" .
                 'Serviço: ' . ($agendamento['servico'] ?? ucfirst($service)) . "\n" .
                 'Data: ' . ($agendamento['data'] ?? '-') . "\n" .
-                'Hora: ' . ($agendamento['hora'] ?? '-') . "\n\nSe você quiser, posso cancelar esse agendamento para tentar um novo.\n\nResponda:\n\n*Sim* ou *Não*",
+                'Hora: ' . ($agendamento['hora'] ?? '-') . "\n\nSe você quiser, posso cancelar esse agendamento para tentar um novo.\n\nResponda:\n\n*Sim* ou *Não*";
+
+            return new ConversationResultDTO(
+                $blockedPrompt,
                 $session->with(['context' => $context]),
                 $intent,
                 $entities,
-                $toolCalls
+                $toolCalls,
+                $this->yesNoReplyPayload($blockedPrompt)
             );
         }
 
@@ -431,7 +455,16 @@ class AiOrchestrator
             'context' => $this->forgetStepAttempts(array_merge($session->context, ['available_dates' => $datas]), 'awaiting_date_choice'),
         ]);
 
-        return new ConversationResultDTO($this->formatDatesMessage($service, $datas), $session, $intent, $entities, $toolCalls);
+        $datesMessage = $this->formatDatesMessage($service, $datas);
+
+        return new ConversationResultDTO(
+            $datesMessage,
+            $session,
+            $intent,
+            $entities,
+            $toolCalls,
+            $datas === [] ? $this->receptionContactReply($datesMessage) : null
+        );
     }
 
     private function handleCpfChangeIntent(IncomingMessageDTO $message, SessionDTO $session, array $entities): ConversationResultDTO
@@ -443,7 +476,7 @@ class AiOrchestrator
             $session = $this->prepareSessionForCpfChange($session, 'consultar_agendamentos');
 
             return new ConversationResultDTO(
-                "Me envie o CPF da pessoa que voce quer atender agora, por favor.\n\nExemplo valido:\n- 111.111.111-11",
+                "Me envie o CPF da pessoa que você quer agendar agora, por favor.\n\nExemplo válido:\n- 111.111.111-11",
                 $session,
                 'change_cpf',
                 $entities
@@ -454,7 +487,7 @@ class AiOrchestrator
             $session = $this->prepareSessionForCpfChange($session, $flow);
 
             return new ConversationResultDTO(
-                "Tudo bem. Me envie o CPF da outra pessoa para eu continuar por aqui.\n\nExemplo valido:\n- 111.111.111-11",
+                "Tudo bem. Me envie o CPF da outra pessoa para eu continuar por aqui.\n\nExemplo válido:\n- 111.111.111-11",
                 $session,
                 'change_cpf',
                 $entities
@@ -496,7 +529,7 @@ class AiOrchestrator
                 $session = $this->prepareSessionForCpfChange($session, 'consultar_agendamentos');
 
                 return new ConversationResultDTO(
-                    "Sem problema. Me envie o CPF que voce quer consultar agora.\n\nExemplo valido:\n- 111.111.111-11",
+                    "Sem problema. Me envie o CPF que você quer consultar agora.\n\nExemplo válido:\n- 111.111.111-11",
                     $session,
                     'change_cpf',
                     $entities
@@ -513,7 +546,7 @@ class AiOrchestrator
                 $intent,
                 $entities,
                 [],
-                'Para eu consultar certinho, me informe seu CPF, por favor.'
+                'Para eu consultar certinho, me informe o CPF, por favor.'
             );
         }
 
@@ -523,7 +556,7 @@ class AiOrchestrator
             && ($this->isDisputingLookupResult($text) || $this->isGreetingMessage($text))
         ) {
             return new ConversationResultDTO(
-                "Ainda nao encontrei agendamentos para esse CPF.\n\nSe quiser, me envie outro CPF, a data aproximada do atendimento ou digite *Menu* para recomecar.",
+                "Ainda não encontrei agendamentos para esse CPF.\n\nDigite *Menu* para recomeçar.",
                 $session,
                 $intent,
                 $entities
@@ -549,18 +582,22 @@ class AiOrchestrator
             ]);
 
             return new ConversationResultDTO(
-                "No momento, nao encontrei agendamentos vinculados a esse CPF.\n\n" .
-                "Se quiser, voce pode me enviar outro CPF, pedir para *trocar CPF*, informar a data aproximada do atendimento ou falar com a recepcao: (66) 9 9204-0540.",
+                "No momento, não encontrei agendamentos vinculados a esse *CPF*.\n\n" .
+                "Se quiser, você pode me enviar o seu *cartão sus*, o agendamento pode ter ocorrido com ele,  pedir para *trocar CPF* ou falar com a recepção.",
                 $session,
                 $intent,
                 $entities,
-                $toolCalls
+                $toolCalls,
+                $this->receptionContactReply(
+                    "No momento, não encontrei agendamentos vinculados a esse *CPF*.\n\n" .
+                    "Se quiser, você pode me enviar o seu *cartão sus*, o agendamento pode ter ocorrido com ele, pedir para *trocar CPF* ou falar com a recepção."
+                )
             );
         }
 
         $linhas = [];
         foreach ($agendamentos as $agendamento) {
-            $linhas[] = ($agendamento['servico'] ?? 'Servico') . ' - ' . ($agendamento['data'] ?? '-') . ' - ' . ($agendamento['hora'] ?? '-');
+            $linhas[] = ($agendamento['servico'] ?? 'Serviço') . ' - ' . ($agendamento['data'] ?? '-') . ' - ' . ($agendamento['hora'] ?? '-');
         }
 
         $session = $session->with([
@@ -569,7 +606,7 @@ class AiOrchestrator
             'context' => $this->forgetTransientConversationContext($session->context),
         ]);
 
-        return new ConversationResultDTO("Encontrei estes agendamentos para voce:\n" . implode("\n", $linhas), $session, $intent, $entities, $toolCalls);
+        return new ConversationResultDTO("Encontrei estes agendamentos para você:\n" . implode("\n", $linhas), $session, $intent, $entities, $toolCalls);
     }
 
     private function handleCancelamento(IncomingMessageDTO $message, SessionDTO $session, string $intent, array $entities): ConversationResultDTO
@@ -585,7 +622,7 @@ class AiOrchestrator
                 $session = $this->prepareSessionForCpfChange($session, 'cancelar_agendamento');
 
                 return new ConversationResultDTO(
-                    "Tudo bem. Me envie o CPF correto para eu localizar o agendamento.\n\nExemplo valido:\n- 111.111.111-11",
+                    "Tudo bem. Me envie o CPF correto para eu localizar o agendamento.\n\nExemplo válido:\n- 111.111.111-11",
                     $session,
                     'change_cpf',
                     $entities
@@ -602,7 +639,7 @@ class AiOrchestrator
                 $intent,
                 $entities,
                 [],
-                'Claro. Para eu localizar o agendamento, me informe seu CPF.'
+                'Claro. Para eu localizar o agendamento, me informe o CPF.'
             );
         }
 
@@ -658,19 +695,23 @@ class AiOrchestrator
                 'current_step' => 'awaiting_menu_choice',
                 'context' => $this->forgetTransientConversationContext($session->context),
             ]);
-            return new ConversationResultDTO('Tudo bem. Nao cancelei nada por aqui.', $session, $intent, $entities);
+            return new ConversationResultDTO('Tudo bem. Não cancelei nada por aqui.', $session, $intent, $entities);
         }
 
         if ($session->pendingAction === 'confirm_cancelamento') {
+            $reply = $this->buildContextualStepReminder(
+                $session,
+                'Para confirmar o cancelamento, me responda apenas com *Sim* ou *Não*.',
+                ['Sim', 'Não']
+            );
+
             return new ConversationResultDTO(
-                $this->buildContextualStepReminder(
-                    $session,
-                    'Para confirmar o cancelamento, me responda apenas com *Sim* ou *Nao*.',
-                    ['Sim', 'Nao']
-                ),
+                $reply,
                 $session->with(['current_step' => 'awaiting_cancellation_confirmation']),
                 $intent,
-                $entities
+                $entities,
+                [],
+                $this->yesNoReplyPayload($reply)
             );
         }
 
@@ -683,7 +724,16 @@ class AiOrchestrator
                     'context' => array_merge($this->forgetTransientConversationContext($session->context), ['cancel_id' => $id]),
                 ]);
 
-                return new ConversationResultDTO("Antes de continuar, preciso confirmar:\n\nDeseja mesmo cancelar esse agendamento?\n\n*Sim* ou *Nao*", $session, $intent, $entities);
+                $reply = "Antes de continuar, preciso confirmar:\n\nDeseja mesmo cancelar esse agendamento?";
+
+                return new ConversationResultDTO(
+                    $reply,
+                    $session,
+                    $intent,
+                    $entities,
+                    [],
+                    $this->yesNoReplyPayload($reply)
+                );
             }
 
             return new ConversationResultDTO(
@@ -713,7 +763,7 @@ class AiOrchestrator
             ]);
 
             return new ConversationResultDTO(
-                "No momento, nao encontrei agendamentos disponiveis para cancelamento.\n\n" .
+                "No momento, não encontrei agendamentos disponíveis para cancelamento.\n\n" .
                 $this->buildCancellationRetryGuidance($session),
                 $session,
                 $intent,
@@ -731,17 +781,20 @@ class AiOrchestrator
                 'context' => array_merge($this->forgetTransientConversationContext($session->context), ['cancel_id' => $id]),
             ]);
 
-            return new ConversationResultDTO(
-                'Encontrei este agendamento:' . "\n\n" .
+            $reply = 'Encontrei este agendamento:' . "\n\n" .
                 'ID: ' . ($agendamento['id'] ?? '-') . "\n" .
-                'Servico: ' . ($agendamento['servico'] ?? '-') . "\n" .
+                'Serviço: ' . ($agendamento['servico'] ?? '-') . "\n" .
                 'Data: ' . ($agendamento['data'] ?? '-') . "\n" .
                 'Hora: ' . ($agendamento['hora'] ?? '-') . "\n\n" .
-                'Deseja cancelar esse agendamento?' . "\n\n*Sim* ou *Nao*",
+                'Deseja mesmo cancelar esse agendamento?';
+
+            return new ConversationResultDTO(
+                $reply,
                 $session,
                 $intent,
                 $entities,
-                $toolCalls
+                $toolCalls,
+                $this->yesNoReplyPayload($reply)
             );
         }
 
@@ -749,7 +802,7 @@ class AiOrchestrator
         $availableIds = [];
         foreach ($agendamentos as $agendamento) {
             $availableIds[] = (string) ($agendamento['id'] ?? '');
-            $linhas[] = 'ID: ' . ($agendamento['id'] ?? '-') . "\nServico: " . ($agendamento['servico'] ?? '-') . "\nData: " . ($agendamento['data'] ?? '-') . "\nHora: " . ($agendamento['hora'] ?? '-');
+            $linhas[] = 'ID: ' . ($agendamento['id'] ?? '-') . "\nServiço: " . ($agendamento['servico'] ?? '-') . "\nData: " . ($agendamento['data'] ?? '-') . "\nHora: " . ($agendamento['hora'] ?? '-');
         }
 
         $session = $session->with([
@@ -785,7 +838,9 @@ class AiOrchestrator
             return $this->continueSchedulingAfterBlockedCancellation($session, $intent, $entities, $toolCalls);
         }
 
-        return new ConversationResultDTO('Para eu continuar, me responda apenas com Sim ou Não.', $session, $intent, $entities);
+        $reply = 'Para eu continuar, me responda apenas com Sim ou Não.';
+
+        return new ConversationResultDTO($reply, $session, $intent, $entities, [], $this->yesNoReplyPayload($reply));
     }
 
     private function continueSchedulingAfterBlockedCancellation(SessionDTO $session, string $intent, array $entities, array $toolCalls = []): ConversationResultDTO
@@ -814,18 +869,18 @@ class AiOrchestrator
 
     private function buildCancellationRetryGuidance(SessionDTO $session): string
     {
-        return "Se voce quiser, posso conferir seus agendamentos gerais para te ajudar melhor.\n\nDigite *4* ou escreva *consultar meus agendamentos*.\nSe preferir, me envie outro CPF ou a data aproximada do atendimento.";
+        return "Se você quiser, posso conferir seus agendamentos, para te ajudar melhor.\n\nDigite *4* ou escreva *consultar meus agendamentos*.\nSe preferir, me envie o numero do cartão SUS para varificar.";
     }
 
     private function buildCancellationChoiceGuidance(array $availableIds, ?SessionDTO $session = null): string
     {
-        $reply = 'Para eu continuar, me diga o *ID* do agendamento que voce deseja cancelar.';
+        $reply = 'Para eu continuar, me diga o *ID* do agendamento que você deseja cancelar.';
 
         if ($session === null) {
             $examples = $this->formatOptionExamples($availableIds);
 
             if ($examples !== []) {
-                $reply .= "\n\nExemplo valido:\n" . implode("\n", $examples);
+                $reply .= "\n\nExemplo válido:\n" . implode("\n", $examples);
             }
 
             return $reply;
@@ -850,11 +905,11 @@ class AiOrchestrator
 
         $formattedExamples = $this->formatOptionExamples($examples);
         if ($formattedExamples !== []) {
-            $parts[] = "Exemplo valido:\n" . implode("\n", $formattedExamples);
+            $parts[] = "Exemplo válido:\n" . implode("\n", $formattedExamples);
         }
 
         if ($includeRestartHint) {
-            $parts[] = 'Se preferir, eu tambem posso recomecar. Basta digitar Sair.';
+            $parts[] = 'Se preferir, eu também posso recomeçar. Basta digitar Sair.';
         }
 
         return implode("\n\n", $parts);
@@ -867,30 +922,30 @@ class AiOrchestrator
             'awaiting_name' => $this->buildContextualStepReminder($session, 'Para eu continuar, me diga o nome completo do paciente.', ['Jeferson Assis']),
             'awaiting_phone' => $this->buildContextualStepReminder($session, 'Para eu continuar, me informe o telefone com DDD.', ['5566996553735']),
             'awaiting_date_choice' => $this->buildContextualStepReminder($session, 'Me diga uma das datas que eu te mostrei, por favor.', $session->context['available_dates'] ?? []),
-            'awaiting_time_choice' => $this->buildContextualStepReminder($session, 'Me diga um dos horarios que eu te mostrei, por favor.', $session->context['available_times'] ?? []),
+            'awaiting_time_choice' => $this->buildContextualStepReminder($session, 'Me diga um dos horários que eu te mostrei, por favor.', $session->context['available_times'] ?? []),
             'awaiting_cancellation_choice' => $this->buildCancellationChoiceGuidance($session->context['available_cancel_ids'] ?? [], $session),
-            'awaiting_cancellation_confirmation' => $this->buildContextualStepReminder($session, 'Para confirmar o cancelamento, me responda apenas com Sim ou Nao.', ['Sim', 'Nao']),
+            'awaiting_cancellation_confirmation' => $this->buildContextualStepReminder($session, 'Para confirmar o cancelamento, me responda apenas com Sim ou Não.', ['Sim', 'Não']),
             'awaiting_lookup_retry' => $session->currentFlow === 'cancelar_agendamento'
-                ? $this->buildContextualStepReminder($session, 'Se quiser, me envie o CPF correto, diga a data aproximada ou escreva consultar meus agendamentos.', ['consultar meus agendamentos', '111.111.111-11'])
-                : $this->buildContextualStepReminder($session, 'Se quiser, me envie outro CPF ou me diga a data aproximada do atendimento.', ['111.111.111-11']),
-            default => $this->buildContextualStepReminder($session, 'Para eu seguir certinho, responda o que esta pendente nesta etapa.', [], true),
+                ? $this->buildContextualStepReminder($session, 'Se quiser, me envie o CPF/CNS correto, diga a data aproximada ou escreva consultar meus agendamentos.', ['consultar meus agendamentos', '111.111.111-11'])
+                : $this->buildContextualStepReminder($session, 'Se quiser, me envie outro CPF/CNS.', ['111.111.111-11']),
+            default => $this->buildContextualStepReminder($session, 'Para eu seguir certinho, responda o que pedi nesta etapa.', [], true),
         };
     }
 
     private function describeCurrentStep(SessionDTO $session): ?string
     {
         return match ($session->currentStep) {
-            'awaiting_cpf' => 'informar seu CPF',
-            'awaiting_name' => 'informar seu nome completo',
-            'awaiting_phone' => 'informar seu telefone com DDD',
+            'awaiting_cpf' => 'informar o CPF',
+            'awaiting_name' => 'informar o nome completo',
+            'awaiting_phone' => 'informar o telefone com DDD',
             'awaiting_date_choice' => 'escolher a data do atendimento',
-            'awaiting_time_choice' => 'escolher o horario do atendimento',
+            'awaiting_time_choice' => 'escolher o horário do atendimento',
             'awaiting_cancellation_choice' => 'escolher o ID do agendamento para cancelar',
             'awaiting_cancellation_confirmation' => 'confirmar se deseja cancelar o agendamento',
             'awaiting_lookup_retry' => $session->currentFlow === 'cancelar_agendamento'
                 ? 'confirmar se existe um agendamento para cancelar'
                 : 'conferir seus agendamentos',
-            'awaiting_menu_choice' => 'escolher uma opcao do menu',
+            'awaiting_menu_choice' => 'escolher uma opção do menu',
             default => null,
         };
     }
@@ -1175,17 +1230,8 @@ class AiOrchestrator
             return $this->returningMenuMessage($session);
         }
 
-        return "Olá! Sou a assistente virtual da UBS Vida Nova (PSF02).\n\n" .
-            "Posso te ajudar por aqui com *agendamentos*, *consulta dos seus horários* e *cancelamentos*.\n" .
-            "Se você precisar falar com a recepção, o atendimento humano também continua disponível.\n\n" .
-            "Escolha uma das opções abaixo:\n" .
-            "1 - Agendar Médico\n" .
-            "2 - Agendar Dentista\n" .
-            "3 - Agendar Enfermeiro\n" .
-            "4 - Consultar meus agendamentos\n" .
-            "5 - Cancelar um agendamento\n\n" .
-            "Para outros assuntos, fale com a recepção: (66) 9 9204-0540\n\n" .
-            "Digite *Sair* a qualquer momento para encerrar este atendimento.";
+        return "Olá! Sou a assistente virtual da UBS Vida Nova (PSF02). 😊\n\n" .
+            "Escolha uma das opções abaixo:";
     }
 
     private function returningMenuMessage(?SessionDTO $session = null): string
@@ -1195,25 +1241,73 @@ class AiOrchestrator
             ? "Olá, {$name}! Como posso te ajudar?"
             : "Olá! Como posso te ajudar?";
 
-        return $greeting . "\n\n" .
-            "Escolha uma das opções abaixo:\n" .
-            "1 - Agendar Médico\n" .
-            "2 - Agendar Dentista\n" .
-            "3 - Agendar Enfermeiro\n" .
-            "4 - Consultar meus agendamentos\n" .
-            "5 - Cancelar um agendamento\n\n" .
-            "Para outros assuntos, fale com a recepção: (66) 9 9204-0540\n\n" .
-            "Digite *Sair* a qualquer momento para encerrar este atendimento.";
+        return $greeting . "\n\nEscolha uma das opções abaixo:";
+    }
+
+    private function mainMenuReplyPayload(?SessionDTO $session = null, bool $preferShortGreeting = false): AssistantReplyDTO
+    {
+        return AssistantReplyDTO::buttons(
+            $this->menuMessage($session, $preferShortGreeting),
+            [
+                $this->quickReplyButton('Agendar consulta', 'agendar_consulta'),
+                $this->quickReplyButton('Cancelar consulta', 'cancelar_agendamento'),
+                $this->quickReplyButton('Consultar agendamentos', 'consultar_agendamentos'),
+            ],
+            self::MAIN_MENU_FOOTER
+        );
     }
 
     private function askForServiceChoice(): string
     {
-        return "Claro. Qual serviço você quer agendar?\n\n1 - Médico\n2 - Dentista\n3 - Enfermeiro";
+        return 'Escolha qual serviço gostaria de agendar:';
+    }
+
+    private function serviceChoiceReplyPayload(): AssistantReplyDTO
+    {
+        return AssistantReplyDTO::buttons(
+            $this->askForServiceChoice(),
+            [
+                $this->quickReplyButton('Médico', 'agendar_medico'),
+                $this->quickReplyButton('Dentista', 'agendar_dentista'),
+                $this->quickReplyButton('Enfermeiro', 'agendar_enfermeiro'),
+            ],
+            'Atendimento automático'
+        );
+    }
+
+    private function receptionContactReply(string $text): AssistantReplyDTO
+    {
+        return AssistantReplyDTO::contact(
+            $text,
+            self::RECEPTION_CONTACT_NAME,
+            self::RECEPTION_CONTACT_PHONE
+        );
+    }
+
+    private function yesNoReplyPayload(string $text): AssistantReplyDTO
+    {
+        return AssistantReplyDTO::buttons(
+            $text,
+            [
+                $this->quickReplyButton('Sim', 'sim'),
+                $this->quickReplyButton('Não', 'nao'),
+            ],
+            'Responda com Sim ou Não'
+        );
+    }
+
+    private function quickReplyButton(string $displayText, string $id): array
+    {
+        return [
+            'type' => 'quick_reply',
+            'displayText' => $displayText,
+            'id' => $id,
+        ];
     }
 
     private function askForCpf(string $service): string
     {
-        return 'Para eu continuar com o agendamento de ' . $this->displayServiceName($service) . ', me informe seu *CPF*, por favor.';
+        return 'Para eu continuar com o agendamento de ' . $this->displayServiceName($service) . ', me informe o número *CPF*, por favor.';
     }
 
     private function buildCpfStepPromptResult(
@@ -1239,7 +1333,7 @@ class AiOrchestrator
     private function formatDatesMessage(string $service, array $dates): string
     {
         if ($dates === []) {
-            return 'No momento, não encontrei datas disponíveis. Se preferir, você também pode falar com a recepção: (66) 9.9204-0540';
+            return 'No momento, não encontrei datas disponíveis. Se preferir, você também pode falar com a recepção.';
         }
 
         return 'Encontrei estas datas disponíveis para ' . $this->displayServiceName($service) . "\n- " . implode("\n- ", $dates) . "\n\nMe diga qual data você prefere, no formato DD/MM/AAAA.";
@@ -1351,10 +1445,10 @@ class AiOrchestrator
         }
 
         return match ($analysis['reason']) {
-            'missing_digits' => 'Esse CPF parece incompleto. O CPF precisa ter 11 numeros. Pode me enviar novamente, por favor?',
-            'extra_digits' => 'Esse CPF veio com numeros a mais. O CPF precisa ter 11 numeros. Pode conferir e me enviar de novo?',
-            'repeated_digits' => 'Esse CPF nao e valido. Nao posso seguir com uma sequencia repetida. Confira e me envie novamente, por favor.',
-            default => 'Esse CPF não passou na validação. Confira os numeros e me envie novamente, por favor.',
+            'missing_digits' => 'Esse CPF parece incompleto. O CPF precisa ter 11 números. Pode me enviar novamente, por favor?',
+            'extra_digits' => 'Esse CPF veio com números a mais. O CPF precisa ter 11 números. Pode conferir e me enviar de novo?',
+            'repeated_digits' => 'Esse CPF não é válido. Não posso seguir com uma sequência repetida. Confira e me envie novamente, por favor.',
+            default => 'Esse CPF não passou na validação. Confira os números e me envie novamente, por favor.',
         };
     }
 
@@ -1663,7 +1757,9 @@ class AiOrchestrator
                 $decision->replyMessage ?? $this->menuMessage(),
                 $session,
                 'flow_recovery_menu',
-                $entities
+                $entities,
+                [],
+                $this->mainMenuReplyPayload()
             );
         }
 
@@ -1693,7 +1789,7 @@ class AiOrchestrator
             }
         }
 
-        return new ConversationResultDTO($this->menuMessage(), $session, 'flow_recovery_fallback', $entities);
+        return new ConversationResultDTO($this->menuMessage(), $session, 'flow_recovery_fallback', $entities, [], $this->mainMenuReplyPayload());
     }
 
     private function normalizeIntent(string $intent, ?string $message, SessionDTO $session): string
@@ -1703,6 +1799,10 @@ class AiOrchestrator
 
         if ($menuIntent !== null) {
             return $menuIntent;
+        }
+
+        if ($this->isCancellationIntentFromText($text) || $intent === 'cancelar_agendamento') {
+            return 'cancelar_agendamento';
         }
 
         $serviceIntent = $this->detectServiceIntentFromText($text);
@@ -1729,6 +1829,15 @@ class AiOrchestrator
         }
 
         return match ($text) {
+            'agendar_consulta' => 'choose_service',
+            'agendar consulta' => 'choose_service',
+            'consultar_agendamentos' => 'consultar_agendamentos',
+            'consultar meus agendamentos' => 'consultar_agendamentos',
+            'cancelar_agendamento' => 'cancelar_agendamento',
+            'cancelar consulta' => 'cancelar_agendamento',
+            'agendar_medico' => 'agendar_medico',
+            'agendar_dentista' => 'agendar_dentista',
+            'agendar_enfermeiro' => 'agendar_enfermeiro',
             '1' => 'agendar_medico',
             '2' => 'agendar_dentista',
             '3' => 'agendar_enfermeiro',
@@ -1781,8 +1890,37 @@ class AiOrchestrator
         return null;
     }
 
+    private function isCancellationIntentFromText(string $text): bool
+    {
+        return preg_match('/\bcancel(a|ar|amento)\b/', $text) === 1;
+    }
+
+    private function isHumanSupportRequest(?string $message): bool
+    {
+        $text = $this->normalizeText((string) $message);
+
+        if ($text === '') {
+            return false;
+        }
+
+        return in_array($text, [
+            'humano',
+            'atendimento humano',
+            'quero humano',
+            'falar com humano',
+            'recepcao',
+            'recepção',
+            'falar com a recepcao',
+            'falar com a recepção',
+        ], true);
+    }
+
     private function isGenericSchedulingRequest(string $text): bool
     {
+        if ($this->isCancellationIntentFromText($text)) {
+            return false;
+        }
+
         if (preg_match('/\b(agendar|agende|marcar|marque|consulta|consultas|agendamento)\b/', $text) !== 1) {
             return false;
         }

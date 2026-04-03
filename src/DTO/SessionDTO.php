@@ -6,6 +6,7 @@ class SessionDTO
 {
     public function __construct(
         public readonly string $phone,
+        public readonly string $provider = 'evolution',
         public readonly ?string $cpf = null,
         public readonly ?string $nome = null,
         public readonly ?string $telefone = null,
@@ -23,6 +24,7 @@ class SessionDTO
     {
         return new self(
             phone: (string) ($data['phone'] ?? ''),
+            provider: self::normalizeProvider($data['provider'] ?? 'evolution'),
             cpf: self::emptyToNull($data['cpf'] ?? null),
             nome: self::emptyToNull($data['nome'] ?? null),
             telefone: self::emptyToNull($data['telefone'] ?? null),
@@ -36,15 +38,16 @@ class SessionDTO
         );
     }
 
-    public static function createEmpty(string $phone): self
+    public static function createEmpty(string $phone, string $provider = 'evolution'): self
     {
-        return new self(phone: $phone);
+        return new self(phone: $phone, provider: self::normalizeProvider($provider));
     }
 
     public function toArray(): array
     {
         return [
             'phone' => $this->phone,
+            'provider' => $this->provider,
             'cpf' => $this->cpf,
             'nome' => $this->nome,
             'telefone' => $this->telefone,
@@ -72,5 +75,12 @@ class SessionDTO
         $string = trim((string) $value);
 
         return $string === '' ? null : $string;
+    }
+
+    private static function normalizeProvider(mixed $value): string
+    {
+        $provider = strtolower(trim((string) $value));
+
+        return in_array($provider, ['evolution', 'papi'], true) ? $provider : 'evolution';
     }
 }

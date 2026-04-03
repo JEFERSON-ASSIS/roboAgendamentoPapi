@@ -11,16 +11,21 @@ class NullMessageQueueRepository implements MessageQueueRepositoryInterface
         return 0;
     }
 
-    public function acquirePhoneLock(string $phone, int $timeoutSeconds): bool
+    public function hasRecentExternalMessageId(string $provider, string $phone, string $externalMessageId): bool
+    {
+        return false;
+    }
+
+    public function acquireConversationLock(string $provider, string $phone, int $timeoutSeconds): bool
     {
         return true;
     }
 
-    public function releasePhoneLock(string $phone): void
+    public function releaseConversationLock(string $provider, string $phone): void
     {
     }
 
-    public function findPendingByPhone(string $phone): array
+    public function findPendingByConversation(string $provider, string $phone): array
     {
         return [];
     }
@@ -29,7 +34,7 @@ class NullMessageQueueRepository implements MessageQueueRepositoryInterface
     {
     }
 
-    public function deleteByPhone(string $phone): int
+    public function deleteByPhone(string $phone, ?string $provider = null): int
     {
         return 0;
     }

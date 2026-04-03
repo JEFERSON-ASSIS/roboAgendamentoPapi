@@ -2,286 +2,204 @@
 
 namespace App\Service;
 
+use App\DTO\ConversationResultDTO;
+use App\DTO\IncomingMessageDTO;
+use App\DTO\OutgoingMessageDTO;
 use App\Infrastructure\Http\HttpClient;
+use App\Service\WhatsApp\EvolutionOutboundProvider;
+use App\Service\WhatsApp\OutboundProviderInterface;
+use App\Service\WhatsApp\PapiOutboundProvider;
 use RuntimeException;
 
 class WhatsAppService
 {
-    public function __construct(
-        private readonly HttpClient $httpClient,
-        private readonly string $baseUrl,
-        private readonly string $instance,
-        private readonly string $apiKey,
-        private readonly bool $sendEnabled = false,
-        private readonly bool $splitMessages = true,
-        private readonly int $maxChunkLength = 700,
-        private readonly int $splitDelayMs = 400,
-        private readonly bool $typingEnabled = false,
-        private readonly int $typingDelayMs = 1200,
-        private readonly bool $typingEachChunk = true
-    ) {
-    }
+    private string $defaultProvider = 'evolution';
 
-    public function isEnabled(): bool
+    /** @var array<string, OutboundProviderInterface> */
+    private array $providers = [];
+
+    public function __construct(mixed ...$args)
     {
-        return $this->sendEnabled && $this->baseUrl !== '' && $this->instance !== '' && $this->apiKey !== '';
-    }
-
-    public function sendText(string $phone, string $text): array
-    {
-        if (!$this->isEnabled()) {
-            return ['status' => 'skipped', 'reason' => 'whatsapp_send_disabled'];
+        if (($args[0] ?? null) instanceof HttpClient) {
+            $this->bootLegacy(...$args);
+            return;
         }
 
-        if ($phone === '' || $text === '') {
-            throw new RuntimeException('Telefone ou texto invalido para envio via WhatsApp.');
-        }
+        $this->defaultProvider = strtolower(trim((string) ($args[0] ?? 'evolution'))) ?: 'evolution';
 
-        $chunks = $this->splitMessages ? $this->splitText($text) : [trim($this->normalizeText($text))];
-        $chunks = array_values(array_filter($chunks, static fn (string $chunk): bool => trim($chunk) !== ''));
-
-        if ($chunks === []) {
-            throw new RuntimeException('Nenhum conteudo valido foi gerado para envio via WhatsApp.');
-        }
-
-        $responses = [];
-        $presenceResponses = [];
-        $totalChunks = count($chunks);
-
-        foreach ($chunks as $index => $chunk) {
-            if ($this->shouldSendTypingForChunk($index)) {
-                $presenceResponses[] = $this->sendTypingPresence($phone);
-            }
-
-            $responses[] = $this->sendSingleText($phone, $chunk);
-
-            if ($index < $totalChunks - 1 && $this->splitDelayMs > 0) {
-                usleep($this->splitDelayMs * 1000);
+        foreach ((array) ($args[1] ?? []) as $provider) {
+            if ($provider instanceof OutboundProviderInterface) {
+                $this->providers[$provider->providerName()] = $provider;
             }
         }
+    }
 
-        return [
-            'status' => $totalChunks > 1 ? 'multi_sent' : 'sent',
-            'parts' => $totalChunks,
-            'chunks' => $chunks,
-            'presence' => $presenceResponses,
-            'responses' => $responses,
+    public static function fromConfig(HttpClient $httpClient, array $config): self
+    {
+        $providersConfig = is_array($config['providers'] ?? null) ? $config['providers'] : [];
+        $legacyDefaults = [
+            'base_url' => (string) ($config['base_url'] ?? ''),
+            'instance' => (string) ($config['instance'] ?? ''),
+            'api_key' => (string) ($config['api_key'] ?? ''),
+            'send_enabled' => (bool) ($config['send_enabled'] ?? false),
+            'split_messages' => (bool) ($config['split_messages'] ?? true),
+            'split_max_length' => (int) ($config['split_max_length'] ?? 700),
+            'split_delay_ms' => (int) ($config['split_delay_ms'] ?? 400),
+            'typing_enabled' => (bool) ($config['typing_enabled'] ?? false),
+            'typing_delay_ms' => (int) ($config['typing_delay_ms'] ?? 1200),
+            'typing_each_chunk' => (bool) ($config['typing_each_chunk'] ?? true),
         ];
-    }
 
-    private function shouldSendTypingForChunk(int $chunkIndex): bool
-    {
-        if (!$this->typingEnabled) {
-            return false;
-        }
-
-        return $this->typingEachChunk || $chunkIndex === 0;
-    }
-
-    private function sendTypingPresence(string $phone): array
-    {
-        if ($this->typingDelayMs <= 0) {
-            return ['status' => 'skipped', 'reason' => 'typing_delay_disabled'];
-        }
-
-        return $this->httpClient->post(
-            rtrim($this->baseUrl, '/') . '/chat/sendPresence/' . rawurlencode($this->instance),
+        $evolutionConfig = array_merge(
+            $legacyDefaults,
+            is_array($providersConfig['evolution'] ?? null) ? $providersConfig['evolution'] : []
+        );
+        $papiConfig = array_merge(
+            $legacyDefaults,
             [
-                'number' => $phone,
-                'delay' => $this->typingDelayMs,
-                'presence' => 'composing',
+                'typing_enabled' => false,
+                'validate_number' => (bool) ($config['validate_number'] ?? true),
             ],
+            is_array($providersConfig['papi'] ?? null) ? $providersConfig['papi'] : []
+        );
+
+        return new self(
+            (string) ($config['default_provider'] ?? $config['provider'] ?? 'evolution'),
             [
-                'apikey' => $this->apiKey,
-            ],
-            30
+                new EvolutionOutboundProvider($httpClient, $evolutionConfig),
+                new PapiOutboundProvider($httpClient, $papiConfig),
+            ]
         );
     }
 
-    private function sendSingleText(string $phone, string $text): array
+    public function isEnabled(?string $provider = null): bool
     {
-        $response = $this->httpClient->post(
-            rtrim($this->baseUrl, '/') . '/message/sendText/' . rawurlencode($this->instance),
-            [
-                'number' => $phone,
-                'text' => $text,
-            ],
-            [
-                'apikey' => $this->apiKey,
-            ],
-            30
-        );
+        $providerInstance = $this->resolveProvider($provider);
 
-        $status = (int) ($response['status'] ?? 0);
-
-        if ($status < 200 || $status >= 300) {
-            $body = trim((string) ($response['body'] ?? ''));
-            $details = $body !== '' ? ' Resposta: ' . $body : '';
-
-            throw new RuntimeException('Falha no envio via WhatsApp. HTTP ' . $status . '.' . $details);
-        }
-
-        return $response;
+        return $providerInstance !== null && $providerInstance->isEnabled();
     }
 
-    private function splitText(string $text): array
+    public function sendText(string $phone, string $text, ?string $provider = null): array
     {
-        $text = trim($this->normalizeText($text));
+        $providerInstance = $this->resolveProvider($provider);
 
-        if ($text === '') {
-            return [];
+        if ($providerInstance === null) {
+            return ['status' => 'skipped', 'reason' => 'provider_not_configured', 'provider' => $provider ?? $this->defaultProvider];
         }
 
-        $blocks = preg_split('/\n{2,}/', $text) ?: [$text];
-        $chunks = [];
-
-        foreach ($blocks as $block) {
-            $block = trim($block);
-
-            if ($block === '') {
-                continue;
-            }
-
-            foreach ($this->splitLargeBlock($block) as $piece) {
-                $piece = trim($piece);
-
-                if ($piece !== '') {
-                    $chunks[] = $piece;
-                }
-            }
-        }
-
-        return $chunks;
+        return $providerInstance->send(new OutgoingMessageDTO(
+            phone: $phone,
+            type: 'text',
+            text: $text
+        ));
     }
 
-    private function splitLargeBlock(string $block): array
+    public function sendButtons(string $phone, string $text, array $buttons, ?string $footer = null, ?string $provider = null): array
     {
-        if (mb_strlen($block) <= $this->maxChunkLength) {
-            return [$block];
+        $providerInstance = $this->resolveProvider($provider);
+
+        if ($providerInstance === null) {
+            return ['status' => 'skipped', 'reason' => 'provider_not_configured', 'provider' => $provider ?? $this->defaultProvider];
         }
 
-        $lines = preg_split('/\n+/', $block) ?: [$block];
-        $chunks = [];
-        $current = '';
-
-        foreach ($lines as $line) {
-            $line = trim($line);
-
-            if ($line === '') {
-                continue;
-            }
-
-            if (mb_strlen($line) > $this->maxChunkLength) {
-                foreach ($this->splitByWords($line) as $wordChunk) {
-                    if ($current !== '') {
-                        $chunks[] = $current;
-                        $current = '';
-                    }
-
-                    $chunks[] = $wordChunk;
-                }
-
-                continue;
-            }
-
-            $candidate = $current === '' ? $line : $current . "\n" . $line;
-
-            if (mb_strlen($candidate) <= $this->maxChunkLength) {
-                $current = $candidate;
-                continue;
-            }
-
-            if ($current !== '') {
-                $chunks[] = $current;
-            }
-
-            $current = $line;
-        }
-
-        if ($current !== '') {
-            $chunks[] = $current;
-        }
-
-        return $chunks;
+        return $providerInstance->send(new OutgoingMessageDTO(
+            phone: $phone,
+            type: 'buttons',
+            text: $text,
+            footer: $footer,
+            buttons: $buttons
+        ));
     }
 
-    private function splitByWords(string $text): array
+    public function sendContact(string $phone, string $text, string $contactName, string $contactPhone, ?string $provider = null): array
     {
-        $words = preg_split('/\s+/', $text) ?: [$text];
-        $chunks = [];
-        $current = '';
+        $providerInstance = $this->resolveProvider($provider);
 
-        foreach ($words as $word) {
-            $word = trim($word);
-
-            if ($word === '') {
-                continue;
-            }
-
-            if (mb_strlen($word) > $this->maxChunkLength) {
-                if ($current !== '') {
-                    $chunks[] = $current;
-                    $current = '';
-                }
-
-                $offset = 0;
-                while ($offset < mb_strlen($word)) {
-                    $chunks[] = mb_substr($word, $offset, $this->maxChunkLength);
-                    $offset += $this->maxChunkLength;
-                }
-
-                continue;
-            }
-
-            $candidate = $current === '' ? $word : $current . ' ' . $word;
-
-            if (mb_strlen($candidate) <= $this->maxChunkLength) {
-                $current = $candidate;
-                continue;
-            }
-
-            if ($current !== '') {
-                $chunks[] = $current;
-            }
-
-            $current = $word;
+        if ($providerInstance === null) {
+            return ['status' => 'skipped', 'reason' => 'provider_not_configured', 'provider' => $provider ?? $this->defaultProvider];
         }
 
-        if ($current !== '') {
-            $chunks[] = $current;
-        }
-
-        return $chunks;
+        return $providerInstance->send(new OutgoingMessageDTO(
+            phone: $phone,
+            type: 'contact',
+            text: $text,
+            contactName: $contactName,
+            contactPhone: $contactPhone
+        ));
     }
 
-    private function normalizeText(string $text): string
+    public function sendReply(IncomingMessageDTO $incoming, ConversationResultDTO|string $reply): array
     {
-        $text = $this->repairEncoding($text);
-        $text = str_replace(["\r\n", "\r"], "\n", $text);
-        $text = preg_replace('/(?:\\\\n|\/n)/', "\n", $text) ?? $text;
-        $text = preg_replace('/\n{3,}/', "\n\n", $text) ?? $text;
+        $provider = $incoming->provider !== '' ? $incoming->provider : $this->defaultProvider;
 
-        return trim($text);
+        if ($reply instanceof ConversationResultDTO) {
+            $payload = $reply->replyPayload();
+
+            $result = match ($payload->type) {
+                'buttons' => $this->sendButtons($incoming->phone, (string) $payload->text, $payload->buttons, $payload->footer, $provider),
+                'contact' => $this->sendContact($incoming->phone, (string) $payload->text, (string) $payload->contactName, (string) $payload->contactPhone, $provider),
+                default => $this->sendText($incoming->phone, (string) $payload->text, $provider),
+            };
+
+            return $this->appendFollowUpContact($incoming->phone, $provider, $payload->meta, $result);
+        }
+
+        return $this->sendText($incoming->phone, $reply, $provider);
     }
 
-    private function repairEncoding(string $text): string
+    private function appendFollowUpContact(string $phone, string $provider, array $meta, array $result): array
     {
-        if ($text === '') {
-            return $text;
+        $followUp = is_array($meta['follow_up_contact'] ?? null) ? $meta['follow_up_contact'] : [];
+        $contactName = trim((string) ($followUp['name'] ?? ''));
+        $contactPhone = trim((string) ($followUp['phone'] ?? ''));
+
+        if ($contactName === '' || $contactPhone === '') {
+            return $result;
         }
 
-        if (!str_contains($text, 'Ãƒ') && !str_contains($text, 'Ã‚')) {
-            return $text;
-        }
+        $contactText = trim((string) ($followUp['text'] ?? ''));
+        $followUpResult = $this->sendContact($phone, $contactText, $contactName, $contactPhone, $provider);
 
-        $decoded = @utf8_decode($text);
-        $reencoded = is_string($decoded) ? @utf8_encode($decoded) : false;
+        $result['follow_up'] = $followUpResult;
 
-        if (is_string($reencoded) && $reencoded !== '' && !str_contains($reencoded, 'Ãƒ') && !str_contains($reencoded, 'Ã‚')) {
-            return $reencoded;
-        }
+        return $result;
+    }
 
-        return $text;
+    private function resolveProvider(?string $provider = null): ?OutboundProviderInterface
+    {
+        $provider = strtolower(trim((string) ($provider ?? $this->defaultProvider)));
+
+        return $this->providers[$provider] ?? null;
+    }
+
+    private function bootLegacy(
+        HttpClient $httpClient,
+        string $baseUrl,
+        string $instance,
+        string $apiKey,
+        bool $sendEnabled = false,
+        bool $splitMessages = true,
+        int $maxChunkLength = 700,
+        int $splitDelayMs = 400,
+        bool $typingEnabled = false,
+        int $typingDelayMs = 1200,
+        bool $typingEachChunk = true
+    ): void {
+        $this->defaultProvider = 'evolution';
+        $this->providers = [
+            'evolution' => new EvolutionOutboundProvider($httpClient, [
+                'base_url' => $baseUrl,
+                'instance' => $instance,
+                'api_key' => $apiKey,
+                'send_enabled' => $sendEnabled,
+                'split_messages' => $splitMessages,
+                'split_max_length' => $maxChunkLength,
+                'split_delay_ms' => $splitDelayMs,
+                'typing_enabled' => $typingEnabled,
+                'typing_delay_ms' => $typingDelayMs,
+                'typing_each_chunk' => $typingEachChunk,
+            ]),
+        ];
     }
 }
 

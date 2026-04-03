@@ -17,7 +17,7 @@ class ConversationService
 
     public function handle(IncomingMessageDTO $message): ConversationResultDTO
     {
-        $session = $this->sessionService->getOrCreate($message->phone);
+        $session = $this->sessionService->getOrCreate($message->phone, $message->provider);
         $result = $this->orchestrator->handle($message, $session);
         $sessionWithHistory = $this->rememberConversationContext($result->session, $message, $result);
         $savedSession = $this->sessionService->save($sessionWithHistory);
@@ -27,7 +27,8 @@ class ConversationService
             $savedSession,
             $result->intent,
             $result->entities,
-            $result->toolCalls
+            $result->toolCalls,
+            $result->replyPayload
         );
     }
 
