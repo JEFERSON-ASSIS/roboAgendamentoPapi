@@ -16,8 +16,8 @@ class AudioTranscriptionService
         private readonly Logger $logger,
         private readonly string $model = 'gpt-4o-mini-transcribe',
         private readonly string $language = 'pt',
-        private readonly string $whatsAppBaseUrl = '',
-        private readonly string $whatsAppApiKey = '',
+        private readonly string|array $whatsAppBaseUrl = '',
+        private readonly string|array $whatsAppApiKey = '',
         private readonly bool $debugSaveAudio = false,
         private readonly string $debugAudioPath = 'storage/audio-debug'
     ) {
@@ -99,7 +99,12 @@ class AudioTranscriptionService
             message: $transcript,
             mediaUrl: $message->mediaUrl,
             pushName: $message->pushName,
-            payload: $payload
+            payload: $payload,
+            provider: $message->provider,
+            remoteJid: $message->remoteJid,
+            instanceId: $message->instanceId,
+            externalMessageId: $message->externalMessageId,
+            interactivePayload: $message->interactivePayload
         );
     }
 
@@ -127,11 +132,13 @@ class AudioTranscriptionService
             throw new RuntimeException('Nao encontrei URL nem base64 do audio para transcricao.');
         }
 
-        $mediaUrl = $this->resolveMediaUrl($message->mediaUrl);
+        $mediaUrl = $this->resolveMediaUrl($message->mediaUrl, $message->provider);
         $headers = [];
 
-        if ($this->whatsAppApiKey !== '') {
-            $headers['apikey'] = $this->whatsAppApiKey;
+        $apiKey = $this->providerApiKey($message->provider);
+
+        if ($apiKey !== '') {
+            $headers['apikey'] = $apiKey;
         }
 
         $response = $this->httpClient->get($mediaUrl, $headers, 90);
@@ -264,7 +271,7 @@ class AudioTranscriptionService
         return null;
     }
 
-    private function resolveMediaUrl(string $mediaUrl): string
+    private function resolveMediaUrl(string $mediaUrl, string $provider): string
     {
         $mediaUrl = trim($mediaUrl);
 
@@ -272,11 +279,39 @@ class AudioTranscriptionService
             return $mediaUrl;
         }
 
-        if ($this->whatsAppBaseUrl === '') {
+        $baseUrl = $this->providerBaseUrl($provider);
+
+        if ($baseUrl === '') {
             return $mediaUrl;
         }
 
-        return rtrim($this->whatsAppBaseUrl, '/') . '/' . ltrim($mediaUrl, '/');
+        return rtrim($baseUrl, '/') . '/' . ltrim($mediaUrl, '/');
+    }
+
+    private function providerBaseUrl(string $provider): string
+    {
+        return $this->providerConfigValue($this->whatsAppBaseUrl, $provider);
+    }
+
+    private function providerApiKey(string $provider): string
+    {
+        return $this->providerConfigValue($this->whatsAppApiKey, $provider);
+    }
+
+    private function providerConfigValue(string|array $value, string $provider): string
+    {
+        if (is_string($value)) {
+            return trim($value);
+        }
+
+        $provider = strtolower(trim($provider));
+        $providerConfig = $value[$provider] ?? null;
+
+        if (is_array($providerConfig)) {
+            return trim((string) ($providerConfig['value'] ?? ''));
+        }
+
+        return trim((string) $providerConfig);
     }
 
     private function extensionFromMimeType(?string $mimeType): string

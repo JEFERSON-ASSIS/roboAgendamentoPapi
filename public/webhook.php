@@ -118,8 +118,14 @@ if ($aiDriver === 'openai') {
         $logger,
         (string) config('services.ai.transcription_model', 'gpt-4o-mini-transcribe'),
         (string) config('services.ai.transcription_language', 'pt'),
-        (string) config('services.whatsapp.base_url', ''),
-        (string) config('services.whatsapp.api_key', '')
+        [
+            'evolution' => (string) config('services.whatsapp.providers.evolution.base_url', (string) config('services.whatsapp.base_url', '')),
+            'papi' => (string) config('services.whatsapp.providers.papi.base_url', ''),
+        ],
+        [
+            'evolution' => (string) config('services.whatsapp.providers.evolution.api_key', (string) config('services.whatsapp.api_key', '')),
+            'papi' => (string) config('services.whatsapp.providers.papi.api_key', ''),
+        ]
     );
 
     $interpreter = new ResilientConversationInterpreter($primaryInterpreter, $fallbackInterpreter, $logger);
@@ -129,19 +135,7 @@ if ($aiDriver === 'openai') {
 
 $orchestrator = new AiOrchestrator($interpreter, $toolRegistry, $logger, $restrictionRuleService, $flowRecoveryService);
 $conversationService = new ConversationService($sessionService, $orchestrator);
-$whatsAppService = new WhatsAppService(
-    $httpClient,
-    (string) config('services.whatsapp.base_url', ''),
-    (string) config('services.whatsapp.instance', ''),
-    (string) config('services.whatsapp.api_key', ''),
-    (bool) config('services.whatsapp.send_enabled', false),
-    (bool) config('services.whatsapp.split_messages', true),
-    (int) config('services.whatsapp.split_max_length', 700),
-    (int) config('services.whatsapp.split_delay_ms', 400),
-    (bool) config('services.whatsapp.typing_enabled', false),
-    (int) config('services.whatsapp.typing_delay_ms', 1200),
-    (bool) config('services.whatsapp.typing_each_chunk', true)
-);
+$whatsAppService = WhatsAppService::fromConfig($httpClient, (array) config('services.whatsapp', []));
 
 $controller = new WebhookController(
     $logger,

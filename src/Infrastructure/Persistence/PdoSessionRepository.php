@@ -7,16 +7,29 @@ use PDO;
 
 class PdoSessionRepository implements SessionRepositoryInterface
 {
+    private bool $providerColumnsEnsured = false;
+
     public function __construct(
         private readonly PDO $pdo,
         private readonly int $ttlMinutes = 0
     ) {
     }
 
-    public function findByPhone(string $phone): ?SessionDTO
+    public function findByPhone(string $phone, ?string $provider = null): ?SessionDTO
     {
-        $statement = $this->pdo->prepare('SELECT * FROM sessions WHERE phone = :phone LIMIT 1');
-        $statement->execute(['phone' => $phone]);
+        $this->ensureProviderColumns();
+
+        if ($provider !== null && trim($provider) !== '') {
+            $statement = $this->pdo->prepare('SELECT * FROM sessions WHERE provider = :provider AND phone = :phone LIMIT 1');
+            $statement->execute([
+                'provider' => strtolower(trim($provider)),
+                'phone' => $phone,
+            ]);
+        } else {
+            $statement = $this->pdo->prepare('SELECT * FROM sessions WHERE phone = :phone ORDER BY provider ASC LIMIT 1');
+            $statement->execute(['phone' => $phone]);
+        }
+
         $row = $statement->fetch();
 
         if (!is_array($row)) {
@@ -24,12 +37,13 @@ class PdoSessionRepository implements SessionRepositoryInterface
         }
 
         if ($this->isExpired($row['last_interaction_at'] ?? null)) {
-            $this->deleteByPhone($phone);
+            $this->deleteByPhone((string) ($row['phone'] ?? ''), (string) ($row['provider'] ?? 'evolution'));
             return null;
         }
 
         return SessionDTO::fromArray([
             'phone' => $row['phone'] ?? '',
+            'provider' => $row['provider'] ?? 'evolution',
             'cpf' => $row['cpf'] ?? null,
             'nome' => $row['nome'] ?? null,
             'telefone' => $row['telefone'] ?? null,
@@ -45,13 +59,15 @@ class PdoSessionRepository implements SessionRepositoryInterface
 
     public function save(SessionDTO $session): SessionDTO
     {
+        $this->ensureProviderColumns();
+
         $sql = <<<'SQL'
 INSERT INTO sessions (
-    phone, cpf, nome, telefone, current_flow, current_step,
+    provider, phone, cpf, nome, telefone, current_flow, current_step,
     selected_service, selected_date, selected_time, pending_action,
     context_json, last_interaction_at
 ) VALUES (
-    :phone, :cpf, :nome, :telefone, :current_flow, :current_step,
+    :provider, :phone, :cpf, :nome, :telefone, :current_flow, :current_step,
     :selected_service, :selected_date, :selected_time, :pending_action,
     :context_json, NOW()
 )
@@ -71,6 +87,7 @@ SQL;
 
         $statement = $this->pdo->prepare($sql);
         $statement->execute([
+            'provider' => $session->provider,
             'phone' => $session->phone,
             'cpf' => $session->cpf,
             'nome' => $session->nome,
@@ -87,10 +104,20 @@ SQL;
         return $session;
     }
 
-    public function deleteByPhone(string $phone): int
+    public function deleteByPhone(string $phone, ?string $provider = null): int
     {
-        $statement = $this->pdo->prepare('DELETE FROM sessions WHERE phone = :phone');
-        $statement->execute(['phone' => $phone]);
+        $this->ensureProviderColumns();
+
+        if ($provider !== null && trim($provider) !== '') {
+            $statement = $this->pdo->prepare('DELETE FROM sessions WHERE provider = :provider AND phone = :phone');
+            $statement->execute([
+                'provider' => strtolower(trim($provider)),
+                'phone' => $phone,
+            ]);
+        } else {
+            $statement = $this->pdo->prepare('DELETE FROM sessions WHERE phone = :phone');
+            $statement->execute(['phone' => $phone]);
+        }
 
         return $statement->rowCount();
     }
@@ -120,4 +147,52 @@ SQL;
 
         return $timestamp < strtotime('-' . $this->ttlMinutes . ' minutes');
     }
+
+    private function ensureProviderColumns(): void
+    {
+        if ($this->providerColumnsEnsured) {
+            return;
+        }
+
+        $columns = [];
+        foreach ($this->pdo->query('SHOW COLUMNS FROM sessions') ?: [] as $row) {
+            $columns[] = strtolower((string) ($row['Field'] ?? ''));
+        }
+
+        if (!in_array('provider', $columns, true)) {
+            $this->pdo->exec("ALTER TABLE sessions ADD COLUMN provider VARCHAR(20) NOT NULL DEFAULT 'evolution' AFTER id");
+        }
+
+        $indexes = [];
+        foreach ($this->pdo->query('SHOW INDEX FROM sessions') ?: [] as $row) {
+            $keyName = strtolower((string) ($row['Key_name'] ?? ''));
+            $indexes[$keyName][] = strtolower((string) ($row['Column_name'] ?? ''));
+        }
+
+        $hasProviderPhoneUnique = false;
+        foreach ($indexes as $keyName => $indexedColumns) {
+            if ($keyName === 'primary') {
+                continue;
+            }
+
+            $indexedColumns = array_values(array_unique($indexedColumns));
+            sort($indexedColumns);
+
+            if ($indexedColumns === ['phone', 'provider']) {
+                $hasProviderPhoneUnique = true;
+                break;
+            }
+        }
+
+        if (!$hasProviderPhoneUnique) {
+            if (isset($indexes['phone']) && $indexes['phone'] === ['phone']) {
+                $this->pdo->exec('ALTER TABLE sessions DROP INDEX phone');
+            }
+
+            $this->pdo->exec('ALTER TABLE sessions ADD UNIQUE KEY uniq_sessions_provider_phone (provider, phone)');
+        }
+
+        $this->providerColumnsEnsured = true;
+    }
 }
+

@@ -13,7 +13,7 @@ class NullMessageLogRepository implements MessageLogRepositoryInterface
         return 0;
     }
 
-    public function deleteByPhone(string $phone): int
+    public function deleteByPhone(string $phone, ?string $provider = null): int
     {
         return 0;
     }
@@ -23,7 +23,7 @@ class NullMessageLogRepository implements MessageLogRepositoryInterface
         return [];
     }
 
-    public function findMessagesByPhone(string $phone, int $limit = 200): array
+    public function findMessagesByPhone(string $phone, int $limit = 200, ?string $provider = null): array
     {
         return [];
     }

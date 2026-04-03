@@ -12,9 +12,9 @@ class SessionService
     ) {
     }
 
-    public function getOrCreate(string $phone): SessionDTO
+    public function getOrCreate(string $phone, string $provider = 'evolution'): SessionDTO
     {
-        return $this->repository->findByPhone($phone) ?? SessionDTO::createEmpty($phone);
+        return $this->repository->findByPhone($phone, $provider) ?? SessionDTO::createEmpty($phone, $provider);
     }
 
     public function save(SessionDTO $session): SessionDTO
@@ -22,13 +22,13 @@ class SessionService
         return $this->repository->save($session);
     }
 
-    public function reset(string $phone): SessionDTO
+    public function reset(string $phone, string $provider = 'evolution'): SessionDTO
     {
-        return $this->save(SessionDTO::createEmpty($phone));
+        return $this->save(SessionDTO::createEmpty($phone, $provider));
     }
 
-    public function forget(string $phone): int
+    public function forget(string $phone, ?string $provider = null): int
     {
-        return $this->repository->deleteByPhone($phone);
+        return $this->repository->deleteByPhone($phone, $provider);
     }
 }
